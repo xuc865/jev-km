@@ -166,8 +166,16 @@ class PlannerPolicy:
         executor cannot name a key that is not live this step.
         """
         state = dict(obs.state or {})
+        # Same resolution order as the executor's build_world. The two tiers must
+        # agree about what the game is, or the plan and the action are conditioned
+        # on different worlds while the dataset records a single row.
+        named = (
+            str(getattr(obs, "game", "") or "")
+            or str(getattr(obs, "name", "") or "")
+            or str(state.get("game") or "")
+        )
         return WorldView(
-            game=str(getattr(obs, "name", "") or ""),
+            game=named,
             goal=goal,
             level=int(obs.level),
             step=int(step),

@@ -722,6 +722,7 @@ class GenericHtmlAdapter:
             level=1,
             done=done,
             success=success,
+            game=str(self.game_id),
             raw={"signature": signature, "artifacts": str(self.artifacts), "observed_at": observed_at},
         )
 

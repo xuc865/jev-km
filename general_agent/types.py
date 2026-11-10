@@ -42,6 +42,11 @@ class Observation:
     done: bool = False
     success: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+    # Which game this frame belongs to. The adapter knows; the policy cannot infer
+    # it. It travels in the observation because it is part of the prompt, and a
+    # blank name here means the model is asked to play an unnamed game while the
+    # recorded row claims otherwise, which is a train/serve mismatch.
+    game: str = ""
 
 
 @dataclass

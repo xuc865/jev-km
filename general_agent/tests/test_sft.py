@@ -21,7 +21,11 @@ from pathlib import Path
 
 from general_agent.client import ModelCall
 from general_agent.contract import SCHEMA_VERSION
+from general_agent.policy import ExecutorPolicy
 from general_agent.sft import RoleRecorder, save_frames
+from general_agent.types import Action, Observation
+
+from .fake_models import ScriptedClient
 
 
 def call(role="executor", text='{"action":"right"}', error="", label=None, frame_sha="") -> ModelCall:
@@ -170,6 +174,31 @@ class RecorderTests(unittest.TestCase):
             summary = recorder.summary()
         self.assertEqual(summary["invalid"], 2)
         self.assertEqual(summary["reasons"], {"reasoning only": 1, "label rejected": 1})
+
+    def test_the_world_carries_the_game_name_from_the_observation(self) -> None:
+        # A blank game name in the prompt while the row records one is a
+        # train/serve mismatch: the student is asked to play an unnamed game and
+        # then scored as if it had been told which one.
+        obs = Observation(actions=[Action("right")], game="demo-1")
+        world = ExecutorPolicy(client=ScriptedClient(), model="m").build_world(obs, "g")
+        self.assertEqual(world.game, "demo-1")
+
+    def test_state_game_is_used_when_the_field_is_absent(self) -> None:
+        # Older adapters put the identifier in state rather than on the observation.
+        obs = Observation(actions=[Action("right")], state={"game": "legacy"})
+        world = ExecutorPolicy(client=ScriptedClient(), model="m").build_world(obs, "g")
+        self.assertEqual(world.game, "legacy")
+
+    def test_the_observation_field_wins_over_state(self) -> None:
+        obs = Observation(actions=[Action("right")], game="explicit",
+                          state={"game": "from-state"})
+        world = ExecutorPolicy(client=ScriptedClient(), model="m").build_world(obs, "g")
+        self.assertEqual(world.game, "explicit")
+
+    def test_a_game_name_never_leaks_into_the_pruned_state(self) -> None:
+        obs = Observation(actions=[Action("right")], game="g1", state={"hp": 3})
+        world = ExecutorPolicy(client=ScriptedClient(), model="m").build_world(obs, "g")
+        self.assertEqual(world.state, {"hp": 3})
 
     def test_messages_are_stored_exactly_as_sent(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

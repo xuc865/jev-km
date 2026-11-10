@@ -180,8 +180,18 @@ class ExecutorPolicy:
             if key not in {"input_universe", "input_excluded", "input_excluded_note",
                            "input_subset_history", "recurrence", "hint", "instructions"}
         }
+        # Three sources, in order of authority: the field adapters now set, the
+        # older `name` attribute, and `state["game"]` which older adapters populate.
+        # A blank value is not harmless: the prompt block would say game:"" while the
+        # training row says which game it was, so the student learns to ignore the
+        # field it is expected to condition on.
+        named = (
+            str(getattr(obs, "game", "") or "")
+            or str(getattr(obs, "name", "") or "")
+            or str(state.get("game") or "")
+        )
         return WorldView(
-            game=str(getattr(obs, "name", "") or ""),
+            game=named,
             goal=goal,
             level=int(obs.level),
             step=self.steps,
