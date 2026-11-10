@@ -13,6 +13,10 @@ runs/
 # tree would make two runs of the same game start from different candidate sets.
 knowledge/_subsets/
 
+# Packaged dataset output. It is derived from runs/ by tools/build_dataset.py and
+# is hundreds of MB of frames; rebuilding it is one command.
+dist/
+
 # Never commit credentials. Both tiers read their token from the environment.
 .env
 .env.*
