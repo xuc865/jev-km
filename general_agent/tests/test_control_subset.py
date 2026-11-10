@@ -1,17 +1,26 @@
-"""Slow-model input pruning: the universe it sees, and the subset it may keep."""
+"""Keyboard pruning: the universe the planner sees, the subset it may exclude.
+
+Split out from the old ``control_exclude`` tests because the mechanism moved. The
+planner no longer returns an ad-hoc verdict dict keyed ``control_exclude``; it
+declares ``exclude`` inside the plan contract, and the executor applies it to the
+adapter when the plan is adopted. The adapter's own clamping rules are unchanged
+and still tested here, because they are what keeps a bad exclusion from leaving
+the game with no controls.
+"""
 
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from general_agent.adapters import generic_html
 from general_agent.adapters.generic_html import GenericHtmlAdapter
-from general_agent.outer import OuterEscalation
-from general_agent.policy import JevPolicy
+from general_agent.contract import PlanDirective, WorldView
+from general_agent.policy import ExecutorPolicy
 from general_agent.types import Action, Observation
+
+from .fake_models import ScriptedClient, executor_reply, planner_reply
 
 
 def make_adapter(tmp: str) -> GenericHtmlAdapter:
@@ -47,8 +56,8 @@ class InputUniverseTests(unittest.TestCase):
         self.assertIn("key_q", offered)
         self.assertIn("digit_9", offered)
         self.assertIn("key_tab", offered)
-        # A key the slow model was shown but the fast model cannot press would
-        # make a correct exclusion look like an invented id.
+        # A key the planner was shown but the executor cannot press would make a
+        # correct exclusion look like an invented id.
         self.assertEqual(offered, universe)
         self.assertIn("escape", universe)
         self.assertIn("restart", universe)
@@ -163,120 +172,123 @@ class CandidateBudgetTests(unittest.TestCase):
                                 generic_html.MIN_CLICK_SLOTS)
 
 
-class OuterSubsetParsingTests(unittest.TestCase):
-    def _outer(self, answer: dict) -> OuterEscalation:
-        def chat(prompt, token, **kwargs):
-            return {"choices": [{"message": {"content": json.dumps(answer)}}]}
-        return OuterEscalation(chat_fn=chat, generate_criteria=True)
+class PlannerExcludeParsingTests(unittest.TestCase):
+    """`exclude` is a plan field now, so it is parsed with the rest of the plan."""
 
-    def _obs(self) -> Observation:
-        return Observation(
-            actions=[Action("move_up"), Action("key_d")],
-            state={"phase": "play", "input_universe": ["move_up", "key_d", "key_q"]},
+    def plan(self, text: str, previous: PlanDirective | None = None, legal=None) -> PlanDirective:
+        from general_agent.contract import parse_planner_reply
+
+        reply = parse_planner_reply(
+            text, previous or PlanDirective(), 3, legal or {"move_up", "key_d", "key_q"}
         )
+        self.assertIsNotNone(reply)
+        return reply.plan
 
-    def test_exclusions_inside_the_universe_are_accepted(self):
-        outer = self._outer({"action": "key_d",
-                             "action_criteria": {"move_up": "when moving", "key_d": "when a beat drops"},
-                             "control_exclude": ["key_q"]})
-        outer(self._obs(), "goal")
-        self.assertEqual(outer.control_exclude, ["key_q"])
-        self.assertTrue(outer.control_exclude_status["applied"])
+    def test_exclusions_are_accepted(self):
+        plan = self.plan(planner_reply(stage_goal="g", exclude=["key_q"]))
+        self.assertEqual(plan.exclude, ("key_q",))
 
-    def test_an_id_outside_the_universe_refuses_the_whole_subset(self):
-        outer = self._outer({"action": "key_d",
-                             "action_criteria": {"move_up": "x", "key_d": "y"},
-                             "control_exclude": ["key_q", "invented_key"]})
-        outer(self._obs(), "goal")
-        self.assertEqual(outer.control_exclude, [])
-        self.assertFalse(outer.control_exclude_status["applied"])
-        self.assertIn("invented_key", outer.control_exclude_status["unknown_ids"])
+    def test_exclusions_are_sorted_and_deduplicated(self):
+        plan = self.plan(
+            '{"stage_goal":"g","exclude":["key_q","key_q","digit_0"]}',
+            legal={"key_q", "digit_0"},
+        )
+        self.assertEqual(plan.exclude, ("digit_0", "key_q"))
 
-    def test_a_non_list_subset_is_ignored(self):
-        outer = self._outer({"action": "key_d",
-                             "action_criteria": {"move_up": "x", "key_d": "y"},
-                             "control_exclude": "key_q"})
-        outer(self._obs(), "goal")
-        self.assertEqual(outer.control_exclude, [])
-        self.assertFalse(outer.control_exclude_status["applied"])
+    def test_an_omitted_exclude_preserves_the_previous_set(self):
+        previous = PlanDirective(stage_goal="g", exclude=("key_q",))
+        plan = self.plan(planner_reply(stage_goal=None, tactics=None, situation="calm"),
+                         previous=previous)
+        self.assertEqual(plan.exclude, ("key_q",))
 
-    def test_an_empty_array_without_a_clear_flag_keeps_the_cached_subset(self):
-        """An unsure answer must not erase what earlier evidence established."""
-        outer = self._outer({"action": "key_d",
-                             "action_criteria": {"move_up": "x", "key_d": "y"},
-                             "control_exclude": []})
-        outer(self._obs(), "goal")
-        self.assertFalse(outer.control_exclude_status["applied"])
+    def test_clear_restores_the_full_keyboard(self):
+        previous = PlanDirective(stage_goal="g", exclude=("key_q",))
+        plan = self.plan('{"stage_goal":"g","exclude":"clear"}', previous=previous)
+        self.assertEqual(plan.exclude, ())
 
-    def test_an_explicit_clear_flag_removes_the_subset(self):
-        outer = self._outer({"action": "key_d",
-                             "action_criteria": {"move_up": "x", "key_d": "y"},
-                             "control_exclude": [],
-                             "control_exclude_clear": True})
-        outer(self._obs(), "goal")
-        self.assertTrue(outer.control_exclude_status["applied"])
-        self.assertEqual(outer.control_exclude, [])
+    def test_a_non_list_exclude_is_ignored(self):
+        previous = PlanDirective(stage_goal="g", exclude=("key_q",))
+        plan = self.plan('{"stage_goal":"g","exclude":42}', previous=previous)
+        self.assertEqual(plan.exclude, ("key_q",))
 
-    def test_the_prompt_states_the_universe_and_the_caution(self):
-        captured = {}
+    def test_the_prompt_states_the_universe_caution(self):
+        from general_agent.prompts import PLANNER_SYSTEM
 
-        def chat(prompt, token, **kwargs):
-            captured["system"] = prompt[0]["content"]
-            return {"choices": [{"message": {"content": json.dumps(
-                {"action": "move_up", "action_criteria": {"move_up": "a", "key_d": "b"},
-                 "control_exclude": []})}}]}
-
-        outer = OuterEscalation(chat_fn=chat, generate_criteria=True)
-        outer(self._obs(), "goal")
-        self.assertIn("control_exclude", captured["system"])
-        self.assertIn("state.input_universe", captured["system"])
-        self.assertIn("empty array", captured["system"])
+        self.assertIn("exclude", PLANNER_SYSTEM)
+        self.assertIn("cannot get back", PLANNER_SYSTEM)
 
 
 class PolicySubsetSinkTests(unittest.TestCase):
-    def test_review_result_reaches_the_adapter_through_the_callback(self):
-        seen = {}
-        policy = JevPolicy(score_fn=lambda *args, **kwargs: {})
-        policy.subset_sink = lambda exclude, note="": seen.update({"exclude": list(exclude), "note": note})
-        obs = Observation(actions=[Action("move_up")],
-                          state={"phase": "play", "input_universe": ["move_up"]})
-        slow = SimpleNamespace(action_criteria={}, control_exclude=["key_q"], situation="rhythm game",
-                               control_exclude_status={"applied": True})
-        policy._accept_outer_result(obs, slow, None)
-        self.assertEqual(seen["exclude"], ["key_q"])
-        self.assertEqual(seen["note"], "rhythm game")
+    def build(self, sink=None) -> ExecutorPolicy:
+        policy = ExecutorPolicy(
+            client=ScriptedClient(executor=[executor_reply("move_up")]), model="fake"
+        )
+        if sink is not None:
+            policy.subset_sink = sink
+        return policy
 
-    def test_an_unaccepted_verdict_does_not_touch_the_adapter(self):
-        policy = JevPolicy(score_fn=lambda *args, **kwargs: {})
-        called = []
-        policy.subset_sink = lambda exclude, note="": called.append(list(exclude))
-        obs = Observation(actions=[Action("move_up")],
-                          state={"phase": "play", "input_universe": ["move_up"]})
-        slow = SimpleNamespace(action_criteria={}, control_exclude=[], situation="",
-                               control_exclude_status={"applied": False})
-        policy._accept_outer_result(obs, slow, None)
-        self.assertEqual(called, [])
+    def obs(self) -> Observation:
+        return Observation(
+            actions=[Action("move_up")],
+            state={"phase": "play", "input_universe": ["move_up", "key_q"]},
+        )
+
+    def test_adopting_a_plan_reaches_the_adapter_through_the_callback(self):
+        seen = {}
+        policy = self.build(
+            lambda exclude, note="": seen.update({"exclude": list(exclude), "note": note})
+        )
+        policy._apply_exclude(PlanDirective(stage_goal="g", exclude=("key_q",), situation="rhythm"))
+        self.assertEqual(seen["exclude"], ["key_q"])
+        self.assertEqual(seen["note"], "rhythm")
+
+    def test_a_rejected_pruning_is_recorded_not_retried(self):
+        policy = self.build(lambda exclude, note="": {"ok": False, "reason": "no play key left"})
+        policy._apply_exclude(PlanDirective(stage_goal="g", exclude=("key_q",)))
+        self.assertIn("no play key left", policy.exclude_note)
 
     def test_no_callback_means_no_crash_for_other_adapters(self):
-        policy = JevPolicy(score_fn=lambda *args, **kwargs: {})
-        obs = Observation(actions=[Action("move_up")],
-                          state={"phase": "play", "input_universe": ["move_up"]})
-        slow = SimpleNamespace(action_criteria={}, control_exclude=["key_q"], situation="",
-                               control_exclude_status={"applied": True})
-        policy._accept_outer_result(obs, slow, None)
+        policy = self.build()
+        policy._apply_exclude(PlanDirective(stage_goal="g", exclude=("key_q",)))
         self.assertIsNone(policy.subset_sink)
+        self.assertEqual(policy.exclude_note, "")
 
-    def test_fast_context_never_receives_the_full_input_universe(self):
-        """The fast model may only name a legal action, so the universe stays out."""
-        policy = JevPolicy(score_fn=lambda *args, **kwargs: {})
-        policy.locked_goal = "goal"
-        obs = Observation(actions=[Action("move_up")],
-                          state={"phase": "play",
-                                 "input_universe": ["move_up", "key_q"],
-                                 "input_excluded": ["key_q"]})
-        world = policy._world(obs, "goal", [], "")
-        self.assertNotIn("key_q", world)
-        self.assertNotIn("input_universe", world)
+    def test_a_raising_callback_does_not_break_the_step(self):
+        def boom(exclude, note=""):
+            raise RuntimeError("adapter gone")
+
+        policy = self.build(boom)
+        policy._apply_exclude(PlanDirective(stage_goal="g", exclude=("key_q",)))
+        self.assertIn("adapter gone", policy.exclude_note)
+
+    def test_a_plan_without_exclusions_does_not_call_the_adapter(self):
+        called = []
+        policy = self.build(lambda exclude, note="": called.append(list(exclude)))
+        policy._apply_exclude(PlanDirective(stage_goal="g"))
+        self.assertEqual(called, [])
+
+    def test_executor_never_receives_the_full_input_universe(self):
+        """The executor may only name a legal action, so the universe stays out."""
+        client = ScriptedClient(executor=[executor_reply("move_up")])
+        policy = ExecutorPolicy(client=client, model="fake")
+        policy.choose(
+            Observation(
+                actions=[Action("move_up")],
+                state={"phase": "play", "input_universe": ["move_up", "key_q"],
+                       "input_excluded": ["key_q"]},
+            ),
+            "goal",
+        )
+        payload = client.payloads("executor")[0]
+        self.assertNotIn("key_q", json.dumps(payload["world"]["state"]))
+        self.assertNotIn("input_universe", payload["world"]["state"])
+
+    def test_excluded_ids_are_also_treated_as_forbidden(self):
+        # The adapter applies the pruning, but the plan is adopted before the next
+        # observation, so the executor must not pick an id it just excluded.
+        policy = self.build()
+        policy.apply_plan(PlanDirective(stage_goal="g", exclude=("move_up",)))
+        self.assertTrue(policy.plan.forbids("move_up"))
 
 
 if __name__ == "__main__":

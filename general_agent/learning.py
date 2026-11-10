@@ -123,7 +123,7 @@ def merge_reflection(game: str, run_id: str, parsed: dict, evidence: list, folde
 
 def distill(folder: Path, chat_fn=None, persist=True, persist_scopes=None):
     import harness
-    from .outer import OuterEscalation
+    from .contract import load_json_object
     folder=folder.resolve();summary=json.loads((folder/'summary.json').read_text(encoding='utf-8'))
     rows=[json.loads(line) for line in (folder/'trace.jsonl').read_text(encoding='utf-8').splitlines()]
     if not rows:raise ValueError('No model decisions to review')
@@ -145,7 +145,7 @@ def distill(folder: Path, chat_fn=None, persist=True, persist_scopes=None):
     response=(chat_fn or harness.chat)(messages,harness.TOKEN,model=harness.SUPERVISOR,**generation)
     if response.get('_error'):raise RuntimeError(response['_error'])
     text=str(((response.get('choices') or [{}])[0].get('message') or {}).get('content') or '')
-    parsed=OuterEscalation._parse(text)
+    parsed=load_json_object(text)
     if not parsed:raise ValueError('Reflection returned invalid JSON')
     report={'game':summary['game'],'run_id':summary['run_id'],'at':datetime.now(timezone.utc).isoformat(),
             'author_model':response.get('model') or harness.SUPERVISOR,'usage':response.get('usage'),

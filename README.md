@@ -1,143 +1,178 @@
 # jev-km
 
-A two-tier (fast/slow) decision system for long-horizon game agents.
+A two-role decision system for long-horizon game agents: one model family, two
+prompts, one strict contract between them.
 
-The design premise is that a single model cannot be both cheap enough to act every
-step and wise enough to plan across a long episode. So decisions are split by
-latency budget rather than by task: a small multimodal scorer picks the actual
-action at every step, and a large reasoning model intervenes only when the fast
-tier is unsure or when the situation has changed enough that the plan is stale.
+Both roles run the same model over `chat/completions`. What separates them is
+responsibility, not capability:
+
+- the **executor** answers one question every step — which legal control do I press
+  now — and reports its reasoning in declared fields;
+- the **planner** answers whether the current stage plan still holds, and publishes
+  a revision. It never names a control.
 
 ```
-                          ┌──────────────────────────────────┐
-                          │  Slow tier: planner / reviewer   │
-                          │  (large reasoning model)         │
-                          └──────────────────────────────────┘
-                             ▲ publishes          │ action_criteria
-                             │ context revision   │ control_exclude (keyboard prune)
-                             │                    ▼
+                    ┌────────────────────────────────────────┐
+                    │  planner                               │
+                    │  same model, planner prompt            │
+                    └────────────────────────────────────────┘
+                       ▲  ExecutorStep            │ PlanDirective
+                       │  (action, why,           │ (briefing, stage_goal,
+                       │   confidence, expect,    │  tactics, situation,
+                       │   belief, stuck,         │  avoid, exclude,
+                       │   outcome)               │  review_in)
+                       │                          ▼
    observe ──► ┌──────────────────────────────────────────┐ ──► execute ──► observe
-               │  Fast tier: candidate scorer              │
-               │  ranks the legal actions for THIS step    │
+               │  executor                                 │
+               │  same model, executor prompt              │
                └──────────────────────────────────────────┘
 
-   every exchange of both tiers is recorded as a training sample
+   every exchange is recorded in contract form as a distillation sample
 ```
 
-## The two tiers
+## Why this replaced a scorer plus a planner
 
-Fast tier — `general_agent/policy.py`
+The previous fast tier was a scoring endpoint. It received a map of action id to
+hand-written usage condition and returned one probability per candidate. That forced
+three things:
 
-`JevPolicy` sends the current observation, the screenshot and a usage sentence for
-each legal action to a small multimodal scorer, which returns one probability per
-candidate. It takes the argmax, subject to a confidence threshold. It cannot
-invent an action: the candidate list comes from the adapter, which owns the game's
-actual action space.
+- the candidate list had to be fully enumerated and described every step, because the
+  scorer could not name anything it was not given;
+- the confidence threshold became the only way to express doubt, because a
+  probability table has no other signal;
+- the planner had to author a per-action condition map to make the list meaningful,
+  which is exactly the burden the split was meant to remove.
 
-Slow tier — `general_agent/outer.py`
+Worse, on a hard step the planner was asked for a single action, so the two tiers
+collapsed into one at the planner's latency and price. A chat model with a role
+prompt needs none of that: it reports its own confidence, states what it expects to
+happen, and names one action directly.
 
-`OuterEscalation` is a larger reasoning model. It never plays step by step. It emits
-a layered plan that the fast tier then executes:
+## The contract
 
-| Field | Lifetime | Purpose |
+`general_agent/contract.py` is the only channel between the roles, and field names
+are training labels. Lifetimes are declared, not implied:
+
+| Field | Lifetime | Read by |
 | --- | --- | --- |
-| `briefing` | stable across reviews | what the game is, controls, win condition |
-| `stage_goal` | until the phase changes | the objective of the current phase or level |
-| `play_instruction` | until revised | concrete steps for the fast tier this stage |
-| `situation` | one review | one sentence on current state and risk |
-| `action` | one step | an optional exact action id to execute |
+| `briefing` | whole episode | executor |
+| `stage_goal` | one stage | executor |
+| `tactics` | one stage | executor |
+| `avoid` | one stage | executor (checked at execution) |
+| `exclude` | whole episode | adapter (prunes the candidate list) |
+| `situation` | one review | executor |
+| `action` | one step | adapter |
 
-The split matters because the two fields age differently. `stage_goal` and
-`play_instruction` are conditions written against observation fields, so they stay
-valid for many fast steps; a coordinate copied into a persistent instruction goes
-stale within a few frames. The prompt therefore asks for conditions that reference
-observation fields, and one-off decisions belong in `action`.
+A reply that only refreshes `situation` cannot silently invalidate `stage_goal`. The
+old design had to guard against that with an "always publish a complete revision"
+rule; here the lifetimes are enforced by the merge in `parse_planner_reply`.
 
-## When the slow tier is consulted
+Payloads are rendered from declared fields and serialised by a canonical `encode()`,
+so two identical situations produce identical bytes. That is what makes a recorded
+prompt a usable training artifact rather than a description of one.
 
-Calling the planner every step would erase the entire point of having a fast tier.
-`JevPolicy.choose` triggers a review on any of:
+## When the planner is consulted
 
-- the first step of the episode
-- the strict confidence threshold is not met (`top < confidence`)
-- the fast scorer returned an error or an empty distribution
-- the recurrence tracker sees the same public state three times in its window
-- the phase, level or headings changed
-- the player moved to a new cell and at least two steps have passed since review
-- the last three actions were identical
-- no plan is cached yet, or the periodic interval elapsed (`call_outer_every`)
+`ExecutorPolicy.choose` reviews on any of the following, in the order they are
+checked:
 
-A review is an optimisation, not a precondition. A failed review increments a
-counter and the fast tier keeps playing; only six consecutive failures stop the
-episode. This was a correction from measurement: an earlier version ended the run
-on the first empty response, which turned a 37-step trajectory into a 4-step one
-because the very first review is unskippable.
+- `first_step` — no plan exists
+- `executor_error` — two consecutive failed reviews
+- `executor_stuck` — the executor reported the plan cannot be carried out
+- `phase_change` — phase, level or the legal set changed
+- `no_change` — the same action three times in a row
+- `low_confidence` — the executor's own confidence fell below the threshold
+- `plan_age` — the interval the planner asked for, floored by configuration
 
-## Confidence and escalation
+The last two are worth contrasting with the old gate. `low_confidence` is the
+model's number about its own choice, so it is comparable across candidate counts;
+the old gate was a softmax mass over a list of varying length. And `plan_age` can be
+lengthened by the planner when a plan works, but not shortened below the floor,
+which is what stops the slow role from turning into a per-step caller.
 
-The fast tier's answer is a distribution over legal actions, which makes the
-"should I escalate" question a threshold on the top probability rather than a
-separate classifier. Below `JEVGAMER_JEV_CONFIDENCE` (default 0.6) the decision is
-escalated. If the slow tier also declines, the policy falls back to the fast
-tier's best non-wait candidate and marks the decision `jev-low`; if there is no
-such candidate it stops. There is deliberately no hand-coded game fallback — a
-right-hand rule only works for mazes and is wrong for shooters, card games and
-platformers.
+## A failed review does not stop the episode
+
+A review is an optimisation on top of a working executor, not a precondition of it.
+This was measured: with the review as a precondition, one unparseable reply discarded
+a whole 37-step trajectory at step 4, because the first-step trigger always fires.
+
+The current rule keeps executing on the previous plan and counts failures, stopping
+at six. A rejected reply also leaves the previous directive in place — an
+unparseable answer has said nothing about whether the plan is wrong.
+
+## Fallback is not a game heuristic
+
+When the executor's reply is unusable, the policy takes the first action that is
+neither `wait` nor forbidden by the plan. `wait` is excluded because in a real game
+it is usually offered during a transition, and taking it on failure turns a decision
+problem into an indefinite stall. If nothing qualifies, the episode stops: the
+harness has no legal way to act and says so rather than guessing.
+
+There is deliberately no hand-coded game fallback. A right-hand rule works for mazes
+and is wrong for shooters, card games and platformers.
+
+## Keyboard pruning
+
+Games in the catalogue range from four-arrow mazes to a rhythm game that listens to
+one row of letters. If the adapter only offers arrows, that game sits on its
+instruction screen for the whole budget.
+
+The adapter publishes `state.input_universe` — every key it can send — and the
+planner may return `exclude`, the ids this game demonstrably ignores. The adapter
+owns the decision to apply it, and refuses any request that would leave fewer than
+four keys or no play key. Excluding an id also excludes its physical alias
+(`key_w` and `move_up_alt` send the same key), otherwise the game would still
+receive it.
+
+The executor never sees the universe, so it cannot name a key that is not live this
+step.
 
 ## Rate limits and dead endpoints
 
-Both failure modes are about the fast endpoint, and they are not the same problem:
-
-A 429 produces an empty probability table during the vendor's cooldown window.
-Waiting is correct, so the call retries up to six times with a twelve-second
-pause. Treating this as a game failure once collapsed 30-sample episodes into
-3-sample ones across a 38-way sweep.
-
-An endpoint that accepts the TCP connection but never answers will not clear by
-waiting. After two consecutive failures the scorer switches to a chat transport
-that answers the same choice question as text classification, and the switch is
-sticky for the episode so a dead endpoint is probed once rather than every step.
+A 429 is back-pressure, not a failure: the same question is asked again after a
+sleep, because a throttled step still has a valid label. Auth failures (401/403) are
+definitive and are not retried. Other retryable statuses back off exponentially.
 
 ## Step clock versus game time
 
 Inference takes seconds; game time does not wait. The browser host freezes the
-original simulation while models are thinking and advances it at 60 Hz when input
-is delivered, so a decision arrives inside the game's own timing windows instead of
-after them. This keeps original timers, stats and difficulty untouched.
+original simulation while models are thinking and advances it at 60 Hz when input is
+delivered, so a decision arrives inside the game's own timing windows.
 
-The distinction that follows is important and is why the recordings are labelled:
-a stepped run proves feasibility of the decision hierarchy, not wall-clock
-real-time control. Real-time is a separate opt-in profile where timers keep
-running during inference, and a stepped recording cannot stand in for it.
+A stepped run therefore proves feasibility of the decision hierarchy, not wall-clock
+real-time control. Real-time is a separate opt-in profile.
 
-## Recording both tiers for training
+## Recording for distillation
 
-`sft.py` writes two append-only JSONL streams per episode:
+`ModelClient` keeps every request/response pair in wire form; the policies stamp the
+accepted contract object onto the call as `label`; `RoleRecorder` writes those to
+`roles.jsonl` per run.
 
-`fast.jsonl` — the exact scorer input (world text, every per-action criterion, the
-attached images, the rebuilt instruction prefix) plus the returned distribution.
-This is the distillation target for a smaller student: it stores the rendered
-sequences rather than the parts, so a student trains on the same tokens the
-teacher saw.
+- a call with `error` is a transport failure, counted as `failed`;
+- a call that arrived but whose label failed validation is also `failed`, which is
+  what makes a prompt regression visible as a validation rate;
+- a call with a valid label whose step had no numeric progress metric is counted
+  `unproven` and not written — an unverifiable row looks like supervision without
+  being supervision.
 
-`slow.jsonl` — the planner's prompt, response, chosen action, usage and latency.
-
-Samples carry the game's own progress metric at that step, so a run can be split
-anywhere and still know whether the state was advancing. Two cases are counted
-rather than written, because writing them would teach the student from noise: a
-step where the scorer returned no distribution has no label, and a step before the
-game published its metric is the title screen, not progress.
+Each row carries `schema`, `role`, `game`, `run_id`, `goal`, `step`,
+`plan_revision`, `trigger`, `messages`, `label`, `raw_reply` and `progress`, so a
+dataset assembled across a refactor can be filtered by `schema` instead of silently
+mixing two prompt shapes.
 
 ## Layout
 
 ```
 general_agent/
-  policy.py         fast tier: JevPolicy, confidence gate, escalation triggers
-  outer.py          slow tier: OuterEscalation, layered plan, keyboard pruning
+  contract.py       the wire contract: dataclasses, parsing, validation, rendering
+  prompts.py        executor and planner system prompts
+  client.py         one chat client for both roles, with retry and recording
+  policy.py         executor: action choice, triggers, plan adoption, fallback
+  outer.py          planner: plan revisions, never an action
   runner.py         episode loop: reset -> observe -> choose -> act
   types.py          Action / Observation / Decision / EpisodeResult
-  live.py           wiring of both tiers + live panel
-  sft.py            FastRecorder / SlowRecorder / SampleWriter
+  live.py           wiring of both roles + live panel
+  sft.py            RoleRecorder: calls -> labelled JSONL
   recurrence.py     repeated-public-state detection
   scene_memory.py   observed-scene snapshots for continuity
   monitor.py        read-only inspection of running episodes
@@ -145,6 +180,7 @@ general_agent/
 agent_harness/      shared model-turn history (Thread / Turn)
 webenv/             browser host, DOM projection, step clock
 map/                game catalogue metadata (ids, categories, entry paths)
+docs/ARCHITECTURE.md  the decision loop in detail
 ```
 
 The boundary is public observation, then model judgment, then normal input, then a
@@ -158,15 +194,10 @@ pip install -r requirements.txt
 python -m pytest general_agent/tests -q
 ```
 
-Expected on this snapshot: `91 passed, 7 failed`. The seven are pre-existing
-failures in the upstream private repository, not artefacts of this extract — they
-were verified to fail identically there. They are left visible rather than skipped
-because two of them encode a behaviour that is currently wrong: `test_runner` and
-`test_panel_dom` both expect a slow-tier transport exception to stop the episode
-before any further input, while the current policy deliberately continues on the
-fast tier and stops only after six consecutive failures. That is an open
-inconsistency between the intended contract and the implemented one, not a missing
-file.
+Expected on this snapshot: `173 passed, 2 subtests passed`. The suite covers the
+contract (parsing, merging, lifetime rules, canonical encoding), the trigger order,
+plan adoption and rejection, the planner's refusal to name an action, keyboard
+pruning, the distillation writer, and the live panel's field names.
 
 ## Configuration
 
@@ -174,23 +205,24 @@ Secrets are read from the environment, never from the tree:
 
 | Variable | Meaning |
 | --- | --- |
-| `JEVGAMER_TOKEN` | API token for both tiers |
-| `JEVGAMER_CHAT` | chat endpoint for the slow tier |
-| `JEVGAMER_SUPERVISOR` | slow-tier model name |
-| `JEVGAMER_JEV_CONFIDENCE` | confidence gate, default 0.6 |
-| `JEVGAMER_JEV_QPM` | fast-tier call budget per minute, default 600 |
-| `JEVGAMER_SLOW_THINKING` | `1` restores reasoning tokens for the slow tier |
+| `JEVGAMER_TOKEN` | API token for both roles |
+| `JEVGAMER_CHAT` | chat endpoint (fallback when the local proxy is down) |
+| `JEVGAMER_CHAT_PROXY` | local rate proxy, preferred when listening |
+| `JEVGAMER_EXECUTOR_MODEL` | executor model, default `deepseek-v4.1-flash` |
+| `JEVGAMER_PLANNER_MODEL` | planner model, default `deepseek-v4.1-flash` |
+| `JEVGAMER_EXECUTOR_CONFIDENCE` | self-reported confidence threshold, default 0.45 |
+| `JEVGAMER_SFT_DIR` | root for `roles.jsonl` output |
 
-Slow-tier thinking defaults to off. Measurements on this system showed a review
-spending ~4785 characters of hidden reasoning and ~1250 completion tokens for a
-response that is a small JSON object, costing 10.6s per review and sometimes
-exhausting the budget so the content came back empty. With thinking off the same
-review took ~1s and ~142 tokens with valid JSON.
+Thinking is off by default for both roles. Measurements showed a review spending
+~4785 characters of hidden reasoning and ~1250 completion tokens for a response that
+is a small JSON object: 10.6s per review, and sometimes the whole budget consumed so
+`content` came back empty. With thinking off the same review took ~1s and ~142
+tokens of valid JSON.
 
 ## What this repository is not
 
-It is the decision core, not the whole research tree. The private upstream
-repository also holds a 188-game library, knowledge packs, recorded runs, and
-several hundred ad-hoc probe scripts. Game assets are absent here on purpose: the
-catalogue is included so the adapters import and so the validated action space is
-documented, but the games themselves are not.
+It is the decision core, not the whole research tree. The private upstream repository
+also holds a 188-game library, knowledge packs, recorded runs, and several hundred
+ad-hoc probe scripts. Game assets are absent here on purpose: the catalogue is
+included so the adapters import and so the validated action space is documented, but
+the games themselves are not.

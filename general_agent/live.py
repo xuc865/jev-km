@@ -24,11 +24,12 @@ from .adapters.gzdoom import catalog_entry as map_entry
 from .adapters.html5 import HtmlGameAdapter
 from .adapters.panel_dom import PanelDomAdapter
 from .adapters.web_runtime import WebRuntimeAdapter
-from .outer import OuterEscalation
-from .policy import JevPolicy
+from .outer import PlannerPolicy
+from .client import ModelClient
+from .policy import ExecutorPolicy
 from .runner import run_episode
 from .monitor import EpisodeMonitor
-from .sft import SampleWriter, attach as attach_sft
+from .sft import RoleRecorder
 from webenv.timing import timing_contract
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,32 +100,38 @@ class LiveRun:
         self.run_id = uuid.uuid4().hex[:12]
         self.folder = ROOT / "runs" / "panel" / self.run_id
         self.folder.mkdir(parents=True, exist_ok=True)
-        self._outer_logged = 0
         if isinstance(self.adapter, (WebRuntimeAdapter, GenericHtmlAdapter)):
             self.adapter.artifacts = self.folder / "browser"
         identity = str((getattr(self.adapter, "config", {}).get("agent") or {}).get("self")
                        or "You are the autonomous player of the current game. Use only available game controls.")
-        self.policy = JevPolicy(token=token, identity=identity,
-                                max_candidates=int(getattr(self.adapter, "max_candidates", 32)),
-                                context_mode=getattr(self.adapter,"config",{}).get("fast_context_mode","standard"))
+        config = getattr(self.adapter, "config", {}) or {}
+        review_every = int(config.get("outer_review_every", 8))
+        # One client for both tiers. They differ in role prompt and expected JSON
+        # shape, not in transport, so a second client would only duplicate the
+        # retry and recording logic.
+        self.client = ModelClient(
+            token=token or os.environ.get("JEVGAMER_TOKEN", ""),
+            max_tokens=config.get("max_output_tokens"),
+            thinking=config.get("slow_generation", {}).get("thinking")
+            if isinstance(config.get("slow_generation"), dict) else None,
+        )
+        self.policy = ExecutorPolicy(
+            client=self.client,
+            identity=identity,
+            max_candidates=int(getattr(self.adapter, "max_candidates", 32)),
+            review_every=review_every,
+        )
+        self.outer = PlannerPolicy(client=self.client, identity=identity)
 
         if isinstance(self.adapter, GenericHtmlAdapter) and hasattr(self.adapter, "apply_subset"):
-            # The slow model may narrow this game's keyboard space. Wiring it as
-            # a callback keeps JevPolicy free of adapter types.
+            # Narrowing the keyboard space is a standing decision the planner can
+            # make, but the adapter still owns the final say on what is usable.
             self.policy.subset_sink = lambda exclude, note="": self.adapter.apply_subset(
-                exclude, note=note, source="slow")
-        self.outer = OuterEscalation(token=token, thread=self.policy.thread, identity=identity,
-                                     generation=getattr(self.adapter,"config",{}).get("slow_generation"),
-                                     generate_criteria=getattr(self.adapter,"config",{}).get("slow_action_criteria",False))
-
-        self.policy.call_outer_every = int(getattr(self.adapter, "config", {}).get("outer_review_every", 8))
-        # SFT capture: wrap the JEV scorer and the slow planner so every model
-        # exchange lands on disk as a training sample, not just a summary row.
-        self.sft = SampleWriter(self.game, self.run_id, goal=self.goal)
-        self.sft_meta = {"adapter": type(self.adapter).__name__,
-                         "fast_context_mode": getattr(self.adapter, "config", {}).get("fast_context_mode", "standard")}
-        attach_sft(self.policy, self.outer, self.sft, game=self.game,
-                   progress_getter=self._adapter_progress)
+                exclude, note=note, source="planner")
+        # Records are pulled from the shared client, so nothing has to wrap the
+        # policies and no monkey-patching of __call__ is needed.
+        self.sft = RoleRecorder(self.game, self.run_id, goal=self.goal)
+        self.sft_meta = {"adapter": type(self.adapter).__name__}
         self.kind = (
             "astray"
             if isinstance(self.adapter, AstrayAdapter)
@@ -223,23 +230,33 @@ class LiveRun:
                 self.decision = decision
                 self.recent = (self.recent + [decision])[-8:]
                 self.status = (
-                    "JEV 决策"
-                    if decision.by == "jev"
-                    else "外环升级"
-                    if decision.by == "escalate"
+                    "执行者决策"
+                    if decision.by == "executor"
+                    else "规划者审核"
+                    if decision.by == "planner"
+                    else "兜底动作"
+                    if decision.by == "fallback"
                     else decision.by
                 )
 
-            # Publish the progress snapshot before the next sample is written so
-            # every row carries the metric of the state it was scored on.
+            # Drain the shared client so every model exchange this step becomes a
+            # training record. Pulling here means a crash loses at most the step
+            # in flight.
+            self.sft.step = step
+            self.sft.plan_revision = getattr(self.policy, "plan", None).revision if getattr(self.policy, "plan", None) else 0
+            self.sft.trigger = getattr(self.outer, "last_trigger", "") or ""
             self.sft.set_progress(self._adapter_progress())
+            self.sft.drain(self.client)
 
             record = {"step": step, "at": time.time(), "elapsed": round(time.time() - self.started_at, 3),
                       "observation": asdict(obs), "decision": asdict(decision),
-                      "outer_calls": self.outer.calls[self._outer_logged:],
+                      "plan": getattr(self.policy, "plan", None).to_wire() if getattr(self.policy, "plan", None) else None,
+                      "executor_step": (
+                          self.policy.last_step.to_wire()
+                          if getattr(self.policy, "last_step", None) else None
+                      ),
                       "progress": self._adapter_progress(),
                       "last_execution": getattr(self.adapter, "last_execution", {})}
-            self._outer_logged = len(self.outer.calls)
             with (self.folder / "trace.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -263,8 +280,12 @@ class LiveRun:
         finally:
             summary = {"game": self.game, "goal": self.goal, "run_id": self.run_id,
                        "result": asdict(self.result) if self.result else None,
-                       "error": self.error, "outer_model": self.outer.model,
-                       "outer_calls": len(self.outer.calls),
+                       "error": self.error, "executor_model": self.policy.model,
+                       "planner_model": self.outer.model,
+                       "planner_revisions": self.outer.revisions,
+                       "planner_error": self.outer.error,
+                       "final_plan": self.outer.plan.to_wire(),
+                       "model_calls": len(self.client.calls),
                        "executions": getattr(self.adapter, "executions", []),
                        "sft": self.sft.summary(),
                        "final_visible_frame": getattr(self.adapter, "_frame", getattr(self.adapter, "_state", {}))}
@@ -309,23 +330,26 @@ class LiveRun:
                 {
                     "by": item.by,
                     "choice": item.action_id,
-                    "probabilities": dict(item.probabilities),
                     "model": item.model,
-                    "image_count": item.image_count,
                     "ms": item.ms,
                     "note": item.note,
                 }
                 for item in self.recent
             ]
+            plan = self.policy.plan
+            step = self.policy.last_step
             return {
                 "game": self.game,
                 "run_id": self.run_id,
                 "run_folder": str(self.folder),
                 "timing_contract": timing_contract(self.adapter.config) if isinstance(self.adapter,WebRuntimeAdapter) else None,
                 "goal": self.goal,
-                "outer_model": self.outer.model,
-                "outer_calls": len(self.outer.calls),
-                "outer_error": self.outer.error,
+                "executor_model": self.policy.model,
+                "planner_model": self.outer.model,
+                "planner_calls": self.outer.revisions,
+                "planner_error": self.outer.error,
+                "planner_verdict": self.outer.verdict,
+                "model_calls": len(self.client.calls),
                 "kind": self.kind,
                 "running": self.running,
                 "status": self.status,
@@ -333,28 +357,30 @@ class LiveRun:
                 "level": self.level,
                 "elapsed": round(time.time() - self.started_at, 1) if self.started_at else 0.0,
                 "actions": actions,
-                "probabilities": dict(decision.probabilities) if decision else {},
                 "choice": decision.action_id if decision else "",
                 "by": decision.by if decision else "",
                 "model": decision.model if decision else "",
-                "image_count": decision.image_count if decision else 0,
                 "ms": decision.ms if decision else 0,
                 "note": decision.note if decision else "",
-                "situation": getattr(self.policy, "outer_situation", ""),
-                "hint": getattr(self.policy, "outer_hint", ""),
-                "briefing": getattr(self.policy, "outer_briefing", ""),
-                "stage_goal": getattr(self.policy, "outer_stage_goal", ""),
-                "play_instruction": getattr(self.policy, "outer_play_instruction", ""),
-                "stage_age": max(
-                    0,
-                    getattr(self.policy, "steps", 0)
-                    - getattr(self.policy, "last_outer_step", 0),
-                ),
-                "visited": len(getattr(self.policy, "visited", set())),
-                "trail": [
-                    {"from": previous, "action": action, "to": current}
-                    for previous, action, current in getattr(self.policy, "trail", [])[-8:]
-                ],
+                "briefing": plan.briefing,
+                "stage_goal": plan.stage_goal,
+                "tactics": plan.tactics,
+                "situation": plan.situation,
+                "avoid": list(plan.avoid),
+                "exclude": list(plan.exclude),
+                "review_in": plan.review_in,
+                "plan_revision": plan.revision,
+                "plan_age": plan.age(getattr(self.policy, "steps", 0)) if plan.revision else 0,
+                "stage_age": plan.age(getattr(self.policy, "steps", 0)) if plan.revision else 0,
+                "executor": {
+                    "why": step.why if step else "",
+                    "confidence": round(step.confidence, 3) if step else 0.0,
+                    "expect": step.expect if step else "",
+                    "belief": step.belief if step else "",
+                    "stuck": step.stuck if step else False,
+                    "repeat_run": step.repeat_run if step else 0,
+                    "outcome": step.outcome if step else "",
+                },
                 "recent": recent,
                 "error": self.error,
                 "image": getattr(self.adapter, "preview", "") or (obs.image if obs else ""),

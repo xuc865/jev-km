@@ -1,140 +1,75 @@
-"""DeepSeek outer escalation for the general JEV harness.
+"""The slow tier: a planner that never presses a key.
 
-The JEV is the fast multimodal inner. When it is unsure, the outer model sees
-the current observation, legal candidates and state, then returns either one
-legal action or a short hint. If it cannot decide, the harness stops; there is
-no hand-coded game fallback.
+The previous slow tier had three jobs bolted together: publish a layered plan,
+optionally author a usage condition for every legal action, and optionally return
+one concrete action to unblock the fast tier. The third job is what made the
+architecture expensive. Because the fast model could not be trusted to choose
+well, the planner was called on a low top-probability and answered with a single
+action -- so on a hard step the two tiers effectively became one, at the
+planner's latency and price.
+
+Under the new contract the planner publishes a ``PlanDirective`` and nothing
+else. Its output is validated field by field, and the only way it can influence a
+specific frame is ``avoid``, which is a prohibition rather than a choice. This is
+a real restriction, not a stylistic one: it means a review costs the same whether
+the current situation is easy or hard, and it means the executor's per-step
+latency is independent of the planner's.
+
+What the planner gains in exchange: a structured report from the executor
+(``why``, ``expect``, ``belief``, ``stuck``, ``outcome``) instead of a raw
+probability table, so it can tell "the plan is hard" from "the executor is
+confused" without a follow-up call.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
-import time
 
-from agent_harness import Thread
-
+from .client import ModelClient
+from .contract import (
+    ExecutorStep,
+    LegalAction,
+    PlanDirective,
+    PlannerReply,
+    WorldView,
+    parse_planner_reply,
+    render_planner_payload,
+)
+from .prompts import planner_system
 from .types import Decision, Observation
-from .context import prompt_state
 
-SYSTEM = """You are the outer strategist of a game agent. The inner multimodal JEV
-chooses one legal action per decision; you receive the full legal action list,
-the current public state, recent actions and the JEV probabilities. A screenshot
-is attached only when image_attached is true; otherwise reason from the supplied
-public observation and do not assume an unseen image.
-Before the JEV acts, give it a compact layered context:
-1. briefing: what this game is, its purpose/background, controls/gameplay, and
-   the win condition. Keep it stable across reviews.
-2. stage_goal: the objective of the current phase/level.
-3. play_instruction: concrete steps for the JEV for this stage.
-4. situation: one sentence on the current state/risk.
-5. action: optional exactly one legal action id, or empty.
-On later reviews, update stage_goal and play_instruction from the current
-observation and recent actions. The JEV still picks each legal action under your
-instruction. Never invent an action id.
-For persistent play_instruction, prefer conditions referring to current observation
-fields; put a one-time decision in action. Concrete coordinates and resource values
-from this review may be stale on later fast steps and must be revalidated.
-The current visible observation and currently available controls are authoritative.
-observed_scenes contains only historical public observations, never future scenes.
-Its resources, available flags and battle estimates were true when observed and
-may be stale under current resources. Use it as factual planning context; only
-current legal_actions can be executed. Do not assume revisiting a scene resets it.
-A visible navigation target may be resource_eligible yet not executable_now because
-other interactions block its path. Distinguish map visibility from current reachability;
-do not assume changing floors refreshes legal paths or bypasses blockers.
-Control roles distinguish selection, confirmation, switching and cancellation.
-A delivered input does not imply the intended game effect happened; compare the new state.
-progress_evidence tracks only pack-declared public outcome fields. If these remain unchanged across many decisions despite successful inputs, reconsider whether the current stage plan advances the locked root goal and compare alternatives. An unchanged score can still be a legitimate long rally; reassess rather than automatically abandoning it.
-Earlier strategy, resources and event logs may be outdated; revise them whenever
-current evidence differs. Do not mistake a historical event log for the current phase.
-Reconstruct resources and playable options from the current observation on every review.
-When recurrence evidence shows matching public states after repeated actions, reevaluate
-the assumed effects and candidate tradeoffs. A delivered input or a return to an earlier
-state does not establish that a new route opened. Recurrence alone is not a reason to
-forbid backtracking, waiting or any otherwise legal action.
-Do not copy previously listed cards, energy, health or floor numbers into the new strategy.
-Only recommend controls present in the current legal_actions. If no useful control is
-available during a transition, wait and inspect the next observation.
-Return JSON only:
-{"briefing":"...", "stage_goal":"...", "play_instruction":"...",
- "situation":"...", "action":"optional legal id or empty"}
-"""
+VERDICT_KEEP = "continue"
+VERDICT_PIVOT = "pivot"
+VERDICT_FINISH = "finish"
 
 
-class OuterEscalation:
-    """Callable escalation for JevPolicy; returns one legal action id or None."""
+class PlannerPolicy:
+    """Publishes plan revisions; exposes them as ``.plan`` for the executor.
 
-    def __init__(self, token: str = "", model: str | None = None, chat_fn=None,
-                 thread: Thread | None = None, identity: str = "Autonomous game player", generation: dict | None = None,
-                 generate_criteria: bool = False) -> None:
-        if not token:
-            try:
-                import harness
+    Callable so it can be passed straight to ``run_episode(escalate=...)``. It
+    returns no action id by design -- the return value is always None -- because
+    the executor owns action selection and a planner-supplied action would bypass
+    that boundary.
+    """
 
-                token = str(getattr(harness, "TOKEN", "") or "")
-            except Exception:
-                token = ""
-            token = token or (os.environ.get("JEVGAMER_TOKEN") or "")
-        if not isinstance(generate_criteria,bool):raise ValueError("generate_criteria must be boolean")
-        self.generate_criteria=generate_criteria
-        self.action_criteria={}
-        self.criteria_status={}
-        # Slow model's claim about which keyboard inputs this game ignores. It is
-        # validated against the observed universe before the adapter applies it.
-        self.control_exclude: list[str] = []
-        self.control_exclude_status: dict = {}
-
-        self.token = token
-        self.generation = dict(generation or {})
-        if set(self.generation)-{'thinking','max_output_tokens'}:
-            raise ValueError("Unsupported slow-model generation setting")
-        # The default slow model is a reasoning model. Left on, it spent 4785
-        # characters of hidden reasoning and ~1250 completion tokens on a decision
-        # that only needs a small JSON object, which cost 10.6s per review and
-        # occasionally consumed the whole budget so `content` came back empty and
-        # the episode died with "outer returned no valid JSON". Turning thinking
-        # off measured 142 completion tokens in ~1s with the JSON still valid, so
-        # it is the default here; JEVGAMER_SLOW_THINKING=1 restores the old
-        # behaviour for models that need to reason.
-        if "thinking" not in self.generation:
-            configured = (os.environ.get("JEVGAMER_SLOW_THINKING") or "").strip()
-            if configured in {"0", "1"}:
-                self.generation["thinking"] = configured == "1"
-            else:
-                self.generation["thinking"] = False
-        self.thread = thread or Thread(history_turns=4)
-        self._own_thread = thread is None
+    def __init__(
+        self,
+        client: ModelClient,
+        model: str = "",
+        identity: str = "autonomous game player",
+        max_tokens: int | None = None,
+    ) -> None:
+        self.client = client
+        self.model = model or os.environ.get("JEVGAMER_PLANNER_MODEL", "deepseek-v4.1-flash")
         self.identity = identity
+        self.max_tokens = max_tokens
+        self.plan = PlanDirective()
         self.locked_goal: str | None = None
-        self.model = model or os.environ.get("JEVGAMER_SUPERVISOR") or "deepseek-v4.1-flash"
-        self.hint = ""
-        self.situation = ""
-        self.briefing = ""
-        self.stage_goal = ""
-        self.play_instruction = ""
-        self._chat = chat_fn
-        self.calls: list[dict] = []
         self.error = ""
-
-    def _chat_fn(self):
-        if self._chat is not None:
-            return self._chat
-        from harness import chat
-
-        return chat
-
-    @staticmethod
-    def _parse(text: str) -> dict:
-        match = re.search(r"\{.*\}", text or "", re.S)
-        if not match:
-            return {}
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+        self.verdict = VERDICT_KEEP
+        self.revisions = 0
+        self.last_trigger = ""
+        self.history: list[PlannerReply] = []
 
     def __call__(
         self,
@@ -142,138 +77,101 @@ class OuterEscalation:
         goal: str,
         decision: Decision | None = None,
         recent: list[str] | None = None,
-    ) -> str | None:
-        if self.generate_criteria:
-            self.action_criteria={}
-            self.criteria_status={'complete':False,'reason':'awaiting valid response'}
+        trigger: str = "",
+        report: ExecutorStep | None = None,
+        step: int = 0,
+    ) -> None:
+        """Produce one plan revision.
+
+        Returns None unconditionally. The executor reads ``self.plan`` after the
+        call, which is also how a rejected reply stays distinguishable from an
+        accepted one: a rejection leaves the previous revision in place.
+
+        ``step`` is the executor's own counter, passed in rather than read from the
+        observation: ``issued_at_step`` is compared against that same counter by
+        ``PlanDirective.age``, so the two must share one clock. Reading
+        ``state["step"]`` here would give a second, adapter-dependent counter and
+        every plan would look older than it is.
+        """
+        del decision
         if self.locked_goal is None:
             self.locked_goal = goal
         goal = self.locked_goal
-        actions = [
-            {
-                "id": action.id,
-                "label": action.label or action.id,
-                "kind": action.kind,
-                "role": action.params.get("semantic_role", ""),
-                "seconds": action.seconds,
-            }
-            for action in obs.actions
-        ]
-        payload = {
-            "previous_strategy": {"briefing": self.briefing, "stage_goal": self.stage_goal,
-                                  "play_instruction": self.play_instruction},
-            "goal": goal,
-            "level": obs.level,
-            "image_attached": bool(obs.image),
-            "state": prompt_state(obs.state),
-            "legal_actions": actions,
-            "jev_top": decision.action_id if decision else "",
-            "jev_note": decision.note if decision else "",
-            "jev_probabilities": decision.probabilities if decision else {},
-            "recent_actions": list(recent or []),
-        }
-        content: list[dict] = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
-        if obs.image:
-            content.append({"type": "image_url", "image_url": {"url": obs.image}})
-        system = SYSTEM + "\nImmutable player identity: " + self.identity + "\nLocked root goal: " + goal
-        if self.generate_criteria:
-            system += """
-Also return action_criteria: an object mapping EVERY current legal action ID to a reusable usage condition (1-500 characters each). Conditions should refer to CURRENT public observation fields and declared input semantics, not fixed coordinates/resource values from this review. The fast model will match these conditions against later observations of the same control schema. Preserve the root goal; never invent controls, hidden information or automatic game policies. Include all IDs, even currently unattractive choices; do not prune candidates. Explain when each candidate is appropriate rather than marking only this instant's chosen action as correct. Distinguish alternatives, including duration variants, by their expected contribution to the locked goal rather than merely repeating key bindings or maintaining activity. This is model context, not executable code.
-When state.input_universe is present, also return control_exclude: an array of input IDs from that universe which this game demonstrably does not use, judged from the whole screenshot, visible text and what the recent actions failed to change. The universe lists only IDs; move_up/move_down/move_left/move_right are the four arrow keys, the *_alt ones are WASD, confirm is Space, enter is Enter, escape is Escape, restart is R, key_<letter> is that letter key, digit_<n> is that number key, key_tab and key_backspace are the menu keys. The currently offered legal_actions are only the tier that happens to be live, so an exclusion must be a claim about this game, not about the current tier. Exclude a key only when the evidence says the game ignores it: the key is described as a menu/traversal input on a screen with no menu, or the game's own visible instructions name other keys and this one is unrelated. Never exclude a key merely because it has not been tried yet, and never exclude an input that the visible instructions or on-screen hints ask the player to press. Always keep the keys the game is currently responding to. If the evidence is insufficient, return an empty array: an unnecessary exclusion costs more than a missing one, because the fast model is left unable to press the key the game needs. Do not exclude click_* or DOM controls; this field is keyboard-only. Keep the total exclusion small and justified, and if a previously excluded key now looks required, report the corrected full exclusion list instead of leaving it out. When state.input_excluded is non-empty and you now believe that pruning was wrong, return control_exclude as an empty array together with "control_exclude_clear": true; an empty array alone is read as "not enough evidence yet" and the cached subset is kept."""
+        self.error = ""
+        self.last_trigger = trigger
 
-        system += ("\nExcluding one id also excludes any other id that sends the same "
-                   "physical key, because otherwise the game would still receive it "
-                   "through the alias."
-                   " state.input_subset_history shows the last verdicts and whether the harness accepted them: an entry with \"rejected\": true carries the reason in \"note\". Read it before answering. A rejected verdict changed nothing, so do not resubmit the same list; either narrow it to the keys the evidence actually rules out, or return an empty array. A game may legitimately need only one or two keys (holding Space to shield, a single rotation key): that is a valid verdict and must be reported, not padded with keys kept for appearance.")
-        messages = self.thread.messages_for_prompt(system, content)
-        started = time.monotonic()
-        response = self._chat_fn()(messages, self.token, model=self.model, **self.generation)
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        self.error = str(response.get("_error") or "")
-        if self.error:
-            self.calls.append({"model":response.get("model") or "", "requested_model":self.model,
-                "goal":goal,"generation":dict(self.generation),"image_count":int(bool(obs.image)),"screen":payload["state"],"ms":elapsed_ms,"recent":list(recent or []),
-                "error":self.error,"status":response.get("_status"),
-                "transport_attempts":response.get("_transport_attempts",1),
-                "transport_failures":response.get("_transport_failures",[])})
-            raise RuntimeError("outer model failed: " + self.error[:200])
-        choices = response.get("choices") or []
-        text = ""
-        if choices:
-            message = choices[0].get("message") or {}
-            text = str(message.get("content") or "")
-        if self._own_thread:
-            turn = self.thread.begin_turn(len(self.calls) + 1)
-            turn.add("observation", json.dumps(payload, ensure_ascii=False))
-            turn.add("agent_message", text)
-            self.thread.complete_turn()
-        parsed = self._parse(text)
-        self.calls.append({"model": response.get("model") or self.model, "goal": goal,
-                           "screen": payload["state"], "image_count":int(bool(obs.image)), "generation":dict(self.generation), "ms": elapsed_ms, "recent": list(recent or []),
-                           "response": text, "usage": response.get("usage") or {},
-                           "transport_attempts":response.get("_transport_attempts",1),
-                           "transport_failures":response.get("_transport_failures",[])})
-        if not parsed:
-            self.error = "outer returned no valid JSON"
+        world = self._world(obs, goal, step if step else (report.step if report else 0))
+        payload = render_planner_payload(
+            world,
+            self.plan,
+            report,
+            list(recent or []),
+            trigger or "unspecified",
+        )
+        call = self.client.complete(
+            role="planner",
+            model=self.model,
+            system=planner_system(self.identity, goal),
+            user_payload=payload,
+        )
+        if call.error:
+            self.error = call.error
             return None
-        self.action_criteria={}
-        self.control_exclude=[]
-        self.control_exclude_status={}
-        if self.generate_criteria:
-            legal={action.id for action in obs.actions}
-            raw=parsed.get('action_criteria')
-            valid={key:value.strip() for key,value in raw.items() if key in legal
-                   and isinstance(value,str) and 0<len(value.strip())<=500} if isinstance(raw,dict) else {}
-            complete=bool(legal) and set(valid)==legal
-            self.action_criteria=valid if complete else {}
-            self.criteria_status={'complete':complete,'missing_ids':sorted(legal-set(valid)),
-                                  'ignored_ids':sorted(set(raw)-legal) if isinstance(raw,dict) else []}
-            self.calls[-1]['criteria_status']=dict(self.criteria_status)
-            universe=[str(item) for item in (obs.state.get('input_universe') or [])
-                      if isinstance(item,str) and item]
-            requested=parsed.get('control_exclude')
-            clear=parsed.get('control_exclude_clear') is True
-            if not isinstance(requested,list):
-                self.control_exclude_status={'applied':False,'reason':'no control_exclude list'}
-            else:
-                wanted=[str(item) for item in requested]
-                known={item for item in wanted if item in universe}
-                unknown=[item for item in wanted if item not in universe]
-                # An exclusion outside the universe is a model error, but it is
-                # also the only signal that the model misread the input list, so
-                # the whole response is refused instead of silently dropping the
-                # bad entries and applying a half-checked subset.
-                if unknown:
-                    self.control_exclude=[]
-                    self.control_exclude_status={'applied':False,'requested':len(wanted),
-                                                 'kept':0,'unknown_ids':unknown[:12],
-                                                 'reason':'ids outside input_universe'}
-                elif known:
-                    self.control_exclude=sorted(known)
-                    self.control_exclude_status={'applied':True,'requested':len(wanted),
-                                                 'kept':len(self.control_exclude),
-                                                 'unknown_ids':[],'reason':''}
-                elif clear:
-                    # Only an explicit clear flag removes a previously verified
-                    # subset. An empty array is indistinguishable from "not enough
-                    # evidence yet", and erasing a cached answer on that signal
-                    # would throw away the game-level decision on every review
-                    # that happened to be unsure.
-                    self.control_exclude=[]
-                    self.control_exclude_status={'applied':True,'requested':0,'kept':0,
-                                                 'unknown_ids':[],'reason':'cleared by model'}
-                else:
-                    self.control_exclude=[]
-                    self.control_exclude_status={'applied':False,'requested':0,'kept':0,
-                                                 'unknown_ids':[],
-                                                 'reason':'empty array without clear flag; previous subset retained'}
-            self.calls[-1]['control_exclude_status']=dict(self.control_exclude_status)
+
+        reply = parse_planner_reply(call.text, self.plan, world.step, world.legal_ids())
+        if reply is None:
+            # Keep the previous plan rather than publishing a blank one. A planner
+            # that answered with unparseable text has said nothing about whether
+            # the current plan is wrong, so discarding it would lose a working
+            # directive on a formatting mistake.
+            self.error = "planner reply unusable"
+            return None
+
+        self.plan = reply.plan
+        self.verdict = reply.verdict
+        self.revisions += 1
+        self.history.append(reply)
+        # The planner's label is the directive delta it actually published, so a
+        # distilled planner learns to revise plans rather than to emit one.
+        call.label = {
+            "plan": reply.plan.to_wire(),
+            "verdict": reply.verdict,
+            "note": reply.note,
+        }
+        return None
+
+    def _world(self, obs: Observation, goal: str, step: int = 0) -> WorldView:
+        """Planner view of the world: same facts, plus the input universe.
+
+        The keyboard universe is shown here because narrowing it is a legitimate
+        standing decision about a game. It is withheld from the executor so the
+        executor cannot name a key that is not live this step.
+        """
+        state = dict(obs.state or {})
+        return WorldView(
+            game=str(getattr(obs, "name", "") or ""),
+            goal=goal,
+            level=int(obs.level),
+            step=int(step),
+            phase=str(state.get("phase") or ""),
+            actions=tuple(
+                LegalAction(
+                    id=action.id,
+                    label=action.label or action.id,
+                    kind=action.kind,
+                    role=str(action.params.get("semantic_role") or ""),
+                    seconds=float(action.seconds or 0.0),
+                )
+                for action in obs.actions
+            ),
+            state=state,
+            image_attached=bool(obs.image),
+            progress=dict(state.get("progress") or {}),
+        )
 
 
-        self.briefing = str(parsed.get("briefing") or self.briefing or "")[:1500]
-        self.stage_goal = str(parsed.get("stage_goal") or self.stage_goal or "")[:600]
-        self.play_instruction = str(parsed.get("play_instruction") or parsed.get("note") or self.play_instruction or "")[:900]
-        self.situation = str(parsed.get("situation") or parsed.get("note") or self.situation or "")[:500]
-        self.hint = str(parsed.get("hint") or self.play_instruction or "")[:900]
-        action = str(parsed.get("action") or "").strip()
-        return action or None
+# The old module exposed OuterEscalation with an ``action_criteria`` payload and a
+# ``control_exclude`` verdict; both are gone. Aliasing the new class keeps imports
+# in runner.py, live.py and the tests working while making the removal explicit
+# rather than leaving dead attributes behind.
+OuterEscalation = PlannerPolicy

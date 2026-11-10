@@ -1,7 +1,29 @@
-# The fast/slow decision loop
+# The two-role decision loop
 
-This document describes how one decision is produced, in the order the code
-actually runs it. It is the map you need before changing either tier.
+One decision, in the order the code runs it. Read this before changing either role.
+
+## The change that defines this design
+
+The two tiers used to differ in *capability*: a scoring endpoint (JEV) answered
+"which of these candidates" and a chat model answered "what should we do". The
+scorer could not name an action outside the list it was given, could not say why,
+and had no way to express doubt except a softmax number. Three costs followed:
+
+- every step had to enumerate and describe the full candidate list;
+- the planner had to author a usage condition per action to make the list
+  meaningful, which is the burden the split was supposed to remove;
+- on a hard step the planner was asked for a single action, so the two tiers
+  collapsed into one at the planner's latency and price.
+
+Now both roles call the same ``chat/completions`` endpoint with the same model.
+Everything that separates them is the role prompt plus the contract in
+``general_agent/contract.py``. The split is along **responsibility**:
+
+- the **executor** answers exactly one question per step: which legal control do I
+  press now? It never sees the win condition, the keyboard universe or the budget.
+- the **planner** answers whether the current stage plan still holds, and publishes
+  a revision. It never names a control. The only way it can touch a specific frame
+  is ``avoid`` (a prohibition) or ``exclude`` (a standing pruning of the input set).
 
 ## One step
 
@@ -9,153 +31,158 @@ actually runs it. It is the map you need before changing either tier.
 flowchart TD
     A[adapter.observe] --> B{episode done?}
     B -->|yes| Z[return result]
-    B -->|no| C{candidate count<br/>over max?}
+    B -->|no| C{candidate count over max?}
     C -->|yes| Y[stop: adapter must prune]
-    C -->|no| D{review trigger<br/>fired?}
-    D -->|yes| E[slow tier: publish plan revision]
-    D -->|no| F[use cached plan]
-    E --> G[fast tier: score all legal actions]
-    F --> G
-    G --> H{top >= confidence?}
-    H -->|yes| I[commit fast action]
-    H -->|no| J[escalate to slow tier]
-    J --> K{slow returned<br/>a legal action?}
-    K -->|yes| L[execute slow action]
-    K -->|no| M{fast has<br/>non-wait candidate?}
-    M -->|yes| N[execute best non-wait]
-    M -->|no| Y
-    I --> O[adapter.act]
-    L --> O
-    N --> O
-    O --> P[record execution to both threads]
+    C -->|no| D{review trigger fired?}
+    D -->|yes| E[planner: publish PlanDirective]
+    E --> E2{valid revision?}
+    E2 -->|no| F[keep previous plan, count failure]
+    E2 -->|yes| E3[adopt plan, reset review clock]
+    F --> G[executor: pick one action]
+    E3 --> G
+    G --> H{action legal and not forbidden?}
+    H -->|yes| O[adapter.act]
+    H -->|no| I[fallback: non-wait, non-forbidden]
+    I -->|none| Y
+    I --> O
+    O --> P[record execution: outcome back to the step report]
     P --> A
 ```
 
-## Why the trigger set is shaped that way
+## Triggers, in the order they are checked
 
-Each trigger answers a different question, and they are OR-ed because any one of
-them alone is insufficient:
+Ordered by how much a review would add. Constants live in ``policy.py`` and the
+trigger string is written into every training record, so a typo would silently
+create a new class.
 
-`first step` — nothing is cached, so the fast tier would be choosing blind.
+`first_step` — no plan exists at all.
 
-`low confidence` — the fast tier itself reports that the candidates are close. This
-is the only trigger driven by the model's own uncertainty rather than by a
-heuristic about the environment.
+`executor_error` — two consecutive failed reviews. The executor has no plan and no
+way to ask again.
 
-`scorer error or empty distribution` — the fast tier cannot answer at all, so its
-opinion carries no information.
+`executor_stuck` — the executor itself reported that the plan cannot be carried out
+from here. This replaces the old "recurrence in window" heuristic: a self-report is
+evidence, a repeating public state is a guess.
 
-`recurrence >= 3 in window` — the agent has been in this public state repeatedly.
-Either the plan is wrong or the actions are ineffective; both need the planner.
+`phase_change` — phase, level or the legal action set changed. The cached tactics
+describe a situation that no longer exists, which is the most expensive staleness
+because the plan still *reads* correct.
 
-`phase / level / headings changed` — the situation the cached plan describes no
-longer exists. Keeping a plan across a phase change is the most expensive kind of
-staleness because the plan still *reads* correct.
+`no_change` — the same action three times in a row. A local loop cannot break
+itself, because the observation that justified the action also justified the repeat.
 
-`cell changed and >= 2 steps since review` — spatial movement without a phase change
-still invalidates concrete coordinates while leaving the stage goal valid. The
-two-step guard avoids reviewing after every single move.
+`low_confidence` — the executor's own number about its own choice fell below the
+threshold. Unlike the old gate this is comparable across candidate counts, because
+it is not a softmax mass over a list of varying length.
 
-`last three actions identical` — a local loop. The fast tier will keep picking the
-same action because the observation keeps looking the same, so the loop cannot
-break itself.
+`plan_age` — the interval the planner asked for, clamped to the configured floor.
+A planner may lengthen it when a plan is working; it cannot shorten it below the
+floor, which is what stops the slow role from becoming a per-step caller.
 
-`interval elapsed` — a floor on review frequency so a long uneventful phase does not
-drift on a stale plan.
+## A failed review does not stop the episode
 
-## Why a failed review does not stop the episode
+The review is an optimisation on top of a working executor, not a precondition of
+it. This was measured the hard way: with the review as a precondition, a single
+unparseable reply discarded a whole 37-step trajectory at step 4, because the
+first-step trigger always fires and therefore always has a chance to fail at the
+worst moment.
 
-The review is an optimisation on top of a working fast loop, not a dependency of it.
-This distinction was learned from a measurement: with the review treated as a
-precondition, one empty response discarded the entire trajectory (4 steps instead of
-37) because the first-step trigger always fires and therefore always has a chance to
-fail at the worst possible moment.
+The current rule keeps executing on the previous plan and counts failures, stopping
+at six. A sustained outage still ends the run, so a dead planner cannot spin the
+executor forever against nothing. A rejected reply also leaves the previous
+directive in place: an unparseable answer has said nothing about whether the plan is
+wrong, so discarding it would lose a working plan over a formatting mistake.
 
-The current rule keeps playing on the cached plan and counts consecutive failures,
-stopping only at six. A sustained outage still terminates the run, so a dead planner
-cannot silently spin the fast tier forever against nothing.
+## The contract
 
-## The confidence gate
+``contract.py`` is the only channel between the roles, and its field names are the
+training labels. Lifetimes are declared rather than implied, fastest to slowest:
 
-The fast tier returns probabilities over legal actions, so escalation is a threshold
-rather than a separate model. Two properties matter:
+| field | lifetime | who reads it |
+|---|---|---|
+| `briefing` | whole episode | executor |
+| `stage_goal` | one stage | executor |
+| `tactics` | one stage | executor |
+| `avoid` | one stage | executor (checked at execution) |
+| `exclude` | whole episode | adapter (applied to the candidate list) |
+| `situation` | one review | executor |
+| `action` | one step | adapter |
 
-The gate is on the *top* probability in absolute terms, not on the margin between
-top and second. A distribution of 0.61/0.39 passes while 0.40/0.38/0.22 fails, which
-matches the intent: "is this action clearly right" rather than "is it clearly
-better than the alternative".
+The executor reports upward in `ExecutorStep`: `action`, `why`, `confidence`,
+`expect`, `belief`, `stuck`, plus `repeat_run`, `plan_revision`, `plan_age` and the
+`outcome` filled in after the fact. That report is the fast role's entire
+contribution to the planner's context. It is a summary, not a transcript: sending
+the planner every frame would make a review cost grow with episode length.
 
-When escalation fails to produce an action, the fallback takes the best non-wait
-candidate rather than stopping. Waiting is excluded because a wait action in a real
-game usually means the game is offering it during a transition, and taking it on
-failure converts a decision problem into an indefinite stall.
+`expect` exists for one reason. The next observation is compared against it, and the
+mismatch is the cheapest available signal that the plan is wrong. It costs no model
+call, so it is recorded every step.
 
-## What the slow tier publishes
+## Encoding is part of the contract
 
-Every response — whether from a scheduled review or a low-confidence escalation —
-publishes one complete context revision. This is deliberate: partial updates let the
-fast tier run with a new stage goal against an old play instruction, which produces
-confident wrong behaviour.
+Both prompts are rendered by ``render_executor_payload`` /
+``render_planner_payload`` from declared fields only, then serialised by
+``encode()`` with pinned separators and preserved key order. Two identical
+situations therefore produce identical bytes, which is what makes the recorded
+prompt a usable training artifact rather than a description of one.
 
-The revision refreshes together:
+A field that is not in a dataclass cannot reach a prompt. That is intentional: the
+old design passed free-form dicts, so the fast tier's input shape drifted with
+whatever prose the planner happened to write that review.
 
-`briefing` (stable), `stage_goal` (phase-scoped), `play_instruction` (stage-scoped),
-`situation` (this review), review age, and the observation-bound action cache.
+## Keyboard pruning
 
-A new revision invalidates the previous compiled action-criteria map, so an old
-directive cannot resurface when an old scene reappears.
+Games in the catalogue range from four-arrow mazes to a rhythm game that listens to
+a single row of letters. If the adapter only offers arrows, that game sits on its
+instruction screen for the whole budget.
 
-## Optional: slow-authored per-action criteria
+The adapter publishes `state.input_universe` — every key it can physically send — and
+the planner may return `exclude`, the ids this game demonstrably ignores. The
+adapter owns the decision to apply it:
 
-When enabled, the slow tier returns a usage condition for *every* legal action id,
-not just the one it would pick. The fast tier then matches those conditions against
-the current observation. This moves the "when is this action appropriate" reasoning
-into the slow tier's budget and leaves the fast tier a pure matching task.
+- ids outside the universe are dropped, since they are typos in a prohibition;
+- the request is refused outright if it would leave fewer than four keys or no play
+  key, and the refusal reason is kept so the next review can correct itself;
+- excluding an id also excludes its physical alias (`key_w` and `move_up_alt` are
+  the same key), otherwise the game would still receive the key.
 
-Completeness is enforced: the map is only used if it covers exactly the current legal
-ids, and any unknown id rejects the whole map rather than being silently dropped.
-A missing id would otherwise leave the fast tier unable to ever choose that action
-while the criterion silently did not apply. The map is also invalidated whenever
-phase, level or control meaning changes, because conditions are written against
-observation fields.
+The executor never sees the universe, so it cannot name a key that is not live this
+step. `exclude` is enforced twice — by the adapter on the candidate list, and by
+`PlanDirective.forbids()` at execution — because the plan is adopted before the next
+observation exists.
 
-This is opt-in (`slow_action_criteria`) and its effect on win rate is not yet
-established — only that it produces the same action on the tested observations.
+## Visibility
 
-## Optional: slow-authored keyboard pruning
+| | executor | planner |
+|---|---|---|
+| legal actions this step | yes | yes |
+| `state.input_universe` | no | yes |
+| `state.hint` / `instructions` | no | yes |
+| progress metric | yes | yes |
+| executor evidence | its own | via `ExecutorStep` |
+| plan | read-only | publishes |
 
-Games in the catalogue range from four-arrow mazes to a rhythm game that listens to a
-single row of letters. If the adapter only offers arrows, a QWERTY rhythm game sits on
-its instruction screen for the whole budget and records zero progress — which is
-exactly what happened before this existed.
+The executor's ignorance is a feature: every fact it does not have is a decision it
+cannot make badly. The planner's extra view is also deliberate — narrowing the
+keyboard is a legitimate standing decision about a game, and it can only be made by
+something that can see the whole keyboard.
 
-The adapter therefore publishes `state.input_universe`, the complete list of keys it
-is physically able to send, and the slow tier returns the subset this specific game
-demonstrably ignores. Three safeguards:
+## Distillation
 
-Ids outside the universe reject the entire response, because that is evidence the
-model misread the input list, and applying the plausible half would be worse than
-applying none.
+`ModelClient` records every request/response pair in wire form, and the policies
+stamp the accepted contract object onto the call as `label`. `RoleRecorder` writes
+those to `roles.jsonl` per run:
 
-An empty array is read as "not enough evidence yet" and keeps the cached subset. Only
-an explicit `control_exclude_clear` removes it. Without this distinction, every
-uncertain review would erase a verified decision.
+- a call with `error` is a transport failure and is counted as `failed`;
+- a call that arrived but whose label was rejected by validation is also `failed`,
+  which is what makes a prompt regression visible as a validation rate;
+- a call whose label is fine but whose step had no numeric progress metric is
+  counted as `unproven` and not written, because an unverifiable row looks like
+  supervision without being supervision;
+- writes are pulled through `client.drain_calls()`, so the client stays unaware of
+  the training pipeline and an unattended run cannot retain every prompt in memory.
 
-The adapter refuses any subset leaving fewer than four keys, and click controls are
-never prunable this way.
-
-The fast tier is deliberately shown only the live legal tier, with the universe
-stripped from its context, so it cannot name a key that is not available this step.
-
-## Threads
-
-Both tiers share `agent_harness.Thread` history, but they do not see the same view.
-The slow tier gets the full review payload with the complete legal action list and the
-fast tier's distribution. The fast tier gets the observation, the current criteria and
-the slow tier's plan — never the full keyboard universe and never the slow tier's
-private reasoning.
-
-Both threads are fed the *actual executed* decision after the fact via
-`record_execution`, tagged as history rather than as a fresh instruction. Without
-that tag the slow tier would read its own executed actions as a new strategy response
-and treat them as confirmation.
+Each row carries `schema`, `role`, `game`, `run_id`, `goal`, `step`,
+`plan_revision`, `trigger`, `messages`, `label`, `raw_reply` and `progress`. A
+dataset assembled across a refactor can therefore be filtered by `schema` instead of
+silently mixing two incompatible prompt shapes.

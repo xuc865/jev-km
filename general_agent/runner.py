@@ -1,4 +1,12 @@
-"""Generic episode loop: observe -> policy -> act -> repeat."""
+"""Generic episode loop: observe -> executor -> act -> repeat.
+
+The loop itself barely changed, and that is intentional: the two-tier split is a
+policy concern, not a loop concern. What did change is the information the loop
+carries. It no longer passes a ``hint`` string down to the policy (loose hints
+were how stale strategy bypassed the plan's declared lifetimes), and it no longer
+reads plan fields off the policy by attribute name for the adapter -- it asks the
+policy for its directive, which is a declared object.
+"""
 
 from __future__ import annotations
 
@@ -6,25 +14,43 @@ import time
 from typing import Callable
 
 from .adapter import GameAdapter
-from .policy import Escalate, JevPolicy
+from .contract import PlanDirective
+from .policy import ExecutorPolicy
 from .types import Decision, EpisodeResult, Observation
 
 StepHook = Callable[[int, Observation, Decision], None]
 
 
+def _directive(policy) -> PlanDirective:
+    """Read the policy's current plan without depending on its concrete type.
+
+    A duck-typed accessor rather than an isinstance check, because tests and
+    alternative policies (a scripted executor, a replay policy) legitimately hold
+    a plan without being an ExecutorPolicy.
+    """
+    plan = getattr(policy, "plan", None)
+    return plan if isinstance(plan, PlanDirective) else PlanDirective()
+
+
 def run_episode(
     adapter: GameAdapter,
-    policy: JevPolicy,
+    policy: ExecutorPolicy,
     goal: str,
     *,
     max_steps: int = 500,
     max_seconds: float = 300.0,
     should_stop: Callable[[], bool] | None = None,
     on_step: StepHook | None = None,
-    escalate: Escalate | None = None,
+    escalate=None,
     hint: str = "",
 ) -> EpisodeResult:
-    """Run one episode; success comes only from the adapter's observation."""
+    """Run one episode; success comes only from the adapter's observation.
+
+    ``hint`` is retained for signature compatibility and ignored: the planner
+    communicates through the plan contract, and a side-channel hint would be a
+    third, undeclared path between the tiers.
+    """
+    del hint
     started = time.time()
     decisions: list[Decision] = []
     recent: list[str] = []
@@ -38,7 +64,7 @@ def run_episode(
             obs = adapter.observe()
             if obs.done:
                 return EpisodeResult(bool(obs.success), step, time.time() - started, decisions)
-            decision = policy.choose(obs, goal, recent=recent, hint=hint, escalate=escalate)
+            decision = policy.choose(obs, goal, recent=recent, escalate=escalate)
             decisions.append(decision)
             if on_step is not None:
                 on_step(step, obs, decision)
@@ -62,10 +88,16 @@ def run_episode(
             if should_stop is not None and should_stop():
                 return EpisodeResult(False, step, time.time() - started, decisions, stopped=True)
             if hasattr(adapter, "show_decision"):
-                adapter.show_decision(decision, {"stage_goal": getattr(policy, "outer_stage_goal", ""),
-                    "play_instruction": getattr(policy, "outer_play_instruction", ""),
-                    "outer_model": (getattr(escalate, "calls", [])[-1].get("model", "")
-                                    if getattr(escalate, "calls", []) else getattr(escalate, "model", ""))})
+                plan = _directive(policy)
+                adapter.show_decision(
+                    decision,
+                    {
+                        "stage_goal": plan.stage_goal,
+                        "tactics": plan.tactics,
+                        "plan_revision": plan.revision,
+                        "planner_model": getattr(escalate, "model", "") if escalate else "",
+                    },
+                )
             adapter.act(action)
             if hasattr(policy, "record_execution"):
                 policy.record_execution(obs, decision, action, getattr(adapter, "last_execution", {}))

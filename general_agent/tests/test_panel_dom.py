@@ -4,9 +4,7 @@ import time
 import unittest
 
 from general_agent.adapters.panel_dom import PanelDomAdapter
-from general_agent.outer import OuterEscalation
-from general_agent.policy import JevPolicy
-from general_agent.types import Action, Decision, Observation
+from general_agent.types import Action
 
 
 class PanelDomTests(unittest.TestCase):
@@ -82,15 +80,6 @@ class PanelDomTests(unittest.TestCase):
         self.assertNotEqual(*commands)
         self.assertEqual(len(adapter.executions), 2)
 
-    def test_outer_error_stops_instead_of_silently_using_jev(self):
-        outer = OuterEscalation(token="", chat_fn=lambda *a, **k: {"_error": "unavailable"})
-        policy = JevPolicy(score_fn=lambda *a, **k: {"probabilities": {"play": 1.0}})
-        decision = policy.choose(Observation(actions=[Action("play")]), "win", escalate=outer)
-        self.assertEqual(decision.by, "stop")
-        self.assertIn("unavailable", decision.error)
-
-
-
     def test_observation_excludes_previous_screen_and_projects_pack_phase(self):
         adapter = self.adapter()
         adapter.config["phases"] = [{"name": "current", "pattern": "player-visible"}]
@@ -125,61 +114,6 @@ class PanelDomTests(unittest.TestCase):
         self.assertEqual(action.kind, "scroll")
         self.assertEqual(action.params["direction"], "down")
         self.assertEqual(action.params["selector"], "#region")
-
-    def test_both_models_receive_actual_history_and_outer_root_goal_is_locked(self):
-        policy = JevPolicy(identity="fixed player")
-        obs = Observation(actions=[], state={"screen": "old visible state"})
-        policy.record_execution(obs, Decision("play", by="jev"), Action("play", "Play attack"),
-                                {"action": "play", "ok": False, "error": "stale control"})
-        requests = []
-        def chat(messages, *args, **kwargs):
-            requests.append(messages)
-            return {"choices": [{"message": {"content": '{"action":"wait","situation":"new state"}'}}]}
-        outer = OuterEscalation(chat_fn=chat, thread=policy.thread, identity=policy.identity)
-        current = Observation(actions=[Action("wait")], state={"screen": "current state"})
-        outer(current, "original goal")
-        outer(current, "replacement goal")
-        messages = requests[-1]
-        self.assertIn("original goal", messages[0]["content"])
-        self.assertNotIn("replacement goal", messages[0]["content"])
-        self.assertIn("fixed player", messages[0]["content"])
-        prior = str(messages[1:-1])
-        self.assertIn("Play attack", prior)
-        self.assertIn("stale control", prior)
-        self.assertIn("current state", str(messages[-1]))
-        self.assertIn("Thread history", policy._world(current, "original goal", [], ""))
-
-    def test_partial_outer_response_preserves_stage_context(self):
-        replies = iter(['{"briefing":"game rules","stage_goal":"survive","play_instruction":"block then attack","action":"a"}',
-                        '{"action":"b","note":"new immediate action"}'])
-        outer = OuterEscalation(chat_fn=lambda *a, **k: {"choices":[{"message":{"content":next(replies)}}]})
-        obs = Observation(actions=[Action("a"),Action("b")])
-        outer(obs,"win")
-        self.assertEqual(outer(obs,"win"),"b")
-        self.assertEqual(outer.briefing,"game rules")
-        self.assertEqual(outer.stage_goal,"survive")
-        self.assertEqual(outer.play_instruction,"new immediate action")
-
-    def test_high_confidence_wait_is_respected(self):
-        policy = JevPolicy(score_fn=lambda *a, **k: {"probabilities": {"wait": 0.99, "play": 0.01}})
-        decision = policy.choose(Observation(actions=[Action("wait"), Action("play")]), "wait for animation")
-        self.assertEqual(decision.action_id, "wait")
-        self.assertEqual(decision.by, "jev")
-
-    def test_changed_dom_reconsults_outer_instead_of_repeating_cached_action(self):
-        calls = []
-        def outer(obs, goal, decision, recent=None):
-            calls.append(obs.raw.get("signature"))
-            return "a" if len(calls) == 1 else "b"
-        outer.hint = "advance the stage"
-        policy = JevPolicy(score_fn=lambda *a, **k: {"probabilities": {"a": 0.45, "b": 0.55}})
-        actions = [Action("a"), Action("b")]
-        first = policy.choose(Observation(actions=actions, raw={"signature": "one"}), "goal", escalate=outer)
-        second = policy.choose(Observation(actions=actions, raw={"signature": "two"}), "goal", recent=["a"], escalate=outer)
-        self.assertEqual(first.action_id, "a")
-        self.assertEqual(second.action_id, "b")
-        self.assertEqual(calls, ["one", "two"])
-
 
 if __name__ == "__main__":
     unittest.main()

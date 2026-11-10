@@ -1,11 +1,13 @@
-"""Tests for the general JEV harness (stdlib unittest; no pytest dependency)."""
+"""Tests for the episode loop under the two-role contract."""
 
 from __future__ import annotations
 
 import unittest
 
-from general_agent import JevPolicy, run_episode
+from general_agent import ExecutorPolicy, PlannerPolicy, run_episode
 from general_agent.types import Action, Observation
+
+from .fake_models import ScriptedClient, executor_reply, planner_reply
 
 
 class FakeAdapter:
@@ -16,6 +18,7 @@ class FakeAdapter:
         self.extra_actions = extra_actions
         self.steps = 0
         self.closed = False
+        self.last_execution: dict = {}
 
     def reset(self) -> None:
         self.steps = 0
@@ -39,138 +42,189 @@ class FakeAdapter:
         self.closed = True
 
 
-class FakeScorer:
-    def __init__(self, probabilities: dict[str, float]) -> None:
-        self.probabilities = probabilities
-        self.calls: list[dict] = []
-
-    def __call__(self, criteria, token, tracks, memory="", images=None):
-        self.calls.append(
-            {"criteria": criteria, "tracks": tracks, "memory": memory, "images": images}
-        )
-        return {
-            "probabilities": dict(self.probabilities),
-            "model": "fake-jev",
-            "image_count": 1 if images else 0,
-            "usage": {"input_tokens": 10},
-        }
+def build(client: ScriptedClient, **kwargs):
+    return (
+        ExecutorPolicy(client=client, model="fake-executor", **kwargs),
+        PlannerPolicy(client=client, model="fake-planner"),
+    )
 
 
 class RunnerTests(unittest.TestCase):
-    def test_jev_top_choice_wins(self) -> None:
+    def test_executor_action_is_executed_and_episode_completes(self) -> None:
         adapter = FakeAdapter(win_after=2)
-        scorer = FakeScorer({"right": 0.9, "wait": 0.1})
-        policy = JevPolicy(score_fn=scorer)
-        result = run_episode(adapter, policy, "reach the exit", max_steps=10)
+        client = ScriptedClient(executor=[executor_reply("right")])
+        result = run_episode(adapter, build(client)[0], "reach the exit", max_steps=10)
         self.assertTrue(result.success)
         self.assertEqual(result.steps, 2)
-        self.assertEqual([d.by for d in result.decisions], ["jev", "jev"])
+        self.assertEqual([d.by for d in result.decisions], ["executor", "executor"])
         self.assertTrue(all(d.action_id == "right" for d in result.decisions))
         self.assertTrue(adapter.closed)
-        self.assertEqual(scorer.calls[0]["tracks"], {"action": ("right", "wait")})
 
-    def test_low_confidence_escalates_to_outer(self) -> None:
+    def test_executor_sees_only_legal_actions_and_no_keyboard_universe(self) -> None:
         adapter = FakeAdapter(win_after=1)
-        scorer = FakeScorer({"right": 0.55, "wait": 0.45})
-        policy = JevPolicy(score_fn=scorer, confidence=0.6)
-        seen: list[str] = []
+        adapter.observe = lambda: Observation(  # type: ignore[method-assign]
+            actions=[Action("right"), Action("wait")],
+            state={"steps": 0, "input_universe": ["a", "b"], "hint": "secret"},
+        )
+        client = ScriptedClient(executor=[executor_reply("right")])
+        run_episode(adapter, build(client)[0], "goal", max_steps=3)
+        payload = client.payloads("executor")[0]
+        self.assertEqual(
+            [item["id"] for item in payload["world"]["legal_actions"]], ["right", "wait"]
+        )
+        self.assertNotIn("input_universe", payload["world"]["state"])
+        self.assertNotIn("hint", payload["world"]["state"])
 
-        def escalate(obs, goal, decision):
-            seen.append(decision.note)
-            return "right"
+    def test_planner_sees_the_keyboard_universe(self) -> None:
+        adapter = FakeAdapter(win_after=2)
+        adapter.observe = lambda: Observation(  # type: ignore[method-assign]
+            actions=[Action("right")],
+            state={"steps": 0, "input_universe": ["a", "b"]},
+        )
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[planner_reply()],
+        )
+        executor, planner = build(client)
+        run_episode(adapter, executor, "goal", max_steps=2, escalate=planner)
+        payload = client.payloads("planner")[0]
+        self.assertIn("input_universe", payload["world"]["state"])
 
-        result = run_episode(adapter, policy, "goal", max_steps=5, escalate=escalate)
-        self.assertTrue(result.success)
-        self.assertIn(result.decisions[0].by, {"escalate", "commit"})
-        self.assertEqual(result.decisions[0].action_id, "right")
-        self.assertEqual(len(seen), 1)
+    def test_unparseable_executor_reply_falls_back_without_stopping(self) -> None:
+        adapter = FakeAdapter(win_after=3)
+        client = ScriptedClient(executor=["not json", executor_reply("right")])
+        result = run_episode(adapter, build(client)[0], "goal", max_steps=4)
+        self.assertEqual(result.decisions[0].by, "fallback")
+        self.assertEqual(result.decisions[1].by, "executor")
 
-    def test_low_confidence_without_outer_uses_jev_non_wait(self) -> None:
+    def test_illegal_action_id_falls_back_instead_of_executing(self) -> None:
         adapter = FakeAdapter(win_after=1)
-        scorer = FakeScorer({"right": 0.51, "wait": 0.49})
-        policy = JevPolicy(score_fn=scorer, confidence=0.9)
-        result = run_episode(adapter, policy, "goal", max_steps=5)
-        self.assertTrue(result.success)
-        self.assertEqual(result.decisions[0].by, "jev-low")
-        self.assertEqual(result.decisions[0].action_id, "right")
-
-    def test_initial_slow_exception_stops_before_any_input(self) -> None:
-        adapter = FakeAdapter(win_after=1)
-        scorer = FakeScorer({"right": 0.95, "wait": 0.05})
-        def unavailable(*args, **kwargs):
-            raise RuntimeError("slow connection unavailable")
-        result = run_episode(adapter, JevPolicy(score_fn=scorer), "goal", max_steps=2, escalate=unavailable)
-        self.assertFalse(result.success)
-        self.assertIn("slow connection unavailable", result.error)
-        self.assertEqual(adapter.steps, 0)
-        self.assertEqual(scorer.calls, [])
-        self.assertTrue(adapter.closed)
-
-    def test_failed_slow_escalation_does_not_execute_one_extra_jev_input(self) -> None:
-        adapter = FakeAdapter(win_after=10)
-        class Slow:
-            hint = ""
-            error = ""
-            calls = 0
-            def __call__(self, *args, **kwargs):
-                self.calls += 1
-                if self.calls > 1:
-                    self.error = "please auth first"
-                    raise RuntimeError(self.error)
-                self.hint = "Valid initial strategy"
-                return None
-        slow = Slow()
-        scores = iter([{"right": 0.95, "wait": 0.05}, {"right": 0.55, "wait": 0.45}])
-        def score(*args, **kwargs):
-            return {"model": "test-jev", "probabilities": next(scores)}
-        result = run_episode(adapter, JevPolicy(score_fn=score), "goal", max_steps=2, escalate=slow)
-        self.assertFalse(result.success)
-        self.assertIn("please auth first", result.error)
-        self.assertEqual(adapter.steps, 1)
-        self.assertEqual(slow.calls, 2)
-        self.assertTrue(adapter.closed)
-
-    def test_reset_failure_closes_partially_created_adapter(self) -> None:
-        adapter = FakeAdapter()
-        def failed_reset():
-            raise RuntimeError("browser startup failed")
-        adapter.reset = failed_reset
-        with self.assertRaisesRegex(RuntimeError, "browser startup failed"):
-            run_episode(adapter, JevPolicy(score_fn=FakeScorer({"right": 0.9})), "goal")
-        self.assertTrue(adapter.closed)
+        client = ScriptedClient(executor=[executor_reply("teleport")])
+        result = run_episode(adapter, build(client)[0], "goal", max_steps=3)
+        self.assertEqual(result.decisions[0].by, "fallback")
+        self.assertNotEqual(result.decisions[0].action_id, "")
 
     def test_no_legal_actions_stops(self) -> None:
         adapter = FakeAdapter(win_after=10)
         adapter.observe = lambda: Observation(actions=[], state={}, done=False)  # type: ignore[method-assign]
-        policy = JevPolicy(score_fn=FakeScorer({"right": 0.9}))
-        result = run_episode(adapter, policy, "goal", max_steps=3)
+        client = ScriptedClient(executor=[executor_reply("right")])
+        result = run_episode(adapter, build(client)[0], "goal", max_steps=3)
         self.assertFalse(result.success)
         self.assertIn("no legal actions", result.error)
 
     def test_too_many_candidates_stops_without_pruning(self) -> None:
         adapter = FakeAdapter(win_after=10, extra_actions=3)
-        policy = JevPolicy(score_fn=FakeScorer({"right": 0.9}), max_candidates=3)
-        result = run_episode(adapter, policy, "goal", max_steps=3)
+        client = ScriptedClient(executor=[executor_reply("right")])
+        result = run_episode(
+            adapter, build(client, max_candidates=3)[0], "goal", max_steps=3
+        )
         self.assertFalse(result.success)
         self.assertIn("adapter must prune", result.error)
 
-    def test_image_forwarded_to_scorer(self) -> None:
-        adapter = FakeAdapter(win_after=1)
-        obs = adapter.observe()
-        obs.image = "data:image/jpeg;base64,AAAA"
-        adapter.observe = lambda: obs  # type: ignore[method-assign]
-        scorer = FakeScorer({"right": 0.9, "wait": 0.1})
-        policy = JevPolicy(score_fn=scorer)
-        run_episode(adapter, policy, "goal", max_steps=3)
-        self.assertEqual(scorer.calls[0]["images"], ["data:image/jpeg;base64,AAAA"])
+    def test_failed_reset_closes_partially_created_adapter(self) -> None:
+        adapter = FakeAdapter()
 
-    def test_bogus_probability_does_not_become_an_action(self) -> None:
-        adapter = FakeAdapter(win_after=10)
-        scorer = FakeScorer({"bogus": 0.99})
-        policy = JevPolicy(score_fn=scorer)
-        result = run_episode(adapter, policy, "goal", max_steps=3)
+        def failed_reset():
+            raise RuntimeError("browser startup failed")
+
+        adapter.reset = failed_reset  # type: ignore[method-assign]
+        client = ScriptedClient(executor=[executor_reply("right")])
+        with self.assertRaisesRegex(RuntimeError, "browser startup failed"):
+            run_episode(adapter, build(client)[0], "goal")
+        self.assertTrue(adapter.closed)
+
+    def test_planner_is_consulted_before_the_first_action(self) -> None:
+        adapter = FakeAdapter(win_after=2)
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[planner_reply(stage_goal="walk to the exit")],
+        )
+        executor, planner = build(client)
+        result = run_episode(adapter, executor, "goal", max_steps=4, escalate=planner)
+        self.assertTrue(result.success)
+        payloads = client.payloads("planner")
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["review_trigger"], "first_step")
+        self.assertIsNone(payloads[0]["executor_report"])
+        self.assertEqual(payloads[0]["current_plan"]["revision"], 0)
+
+    def test_plan_reaches_the_executor_on_the_same_step(self) -> None:
+        adapter = FakeAdapter(win_after=1)
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[planner_reply(stage_goal="walk to the exit", tactics="hold right")],
+        )
+        executor, planner = build(client)
+        run_episode(adapter, executor, "goal", max_steps=2, escalate=planner)
+        payload = client.payloads("executor")[0]
+        self.assertEqual(payload["plan"]["stage_goal"], "walk to the exit")
+        self.assertEqual(payload["plan"]["tactics"], "hold right")
+        self.assertEqual(payload["plan"]["revision"], 1)
+
+    def test_planner_failure_does_not_block_the_executor(self) -> None:
+        adapter = FakeAdapter(win_after=2)
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[RuntimeError("planner down")],
+        )
+        executor, planner = build(client)
+        result = run_episode(adapter, executor, "goal", max_steps=4, escalate=planner)
+        self.assertTrue(result.success)
+        self.assertEqual(result.decisions[0].by, "executor")
+
+    def test_sustained_planner_outage_stops_the_episode(self) -> None:
+        adapter = FakeAdapter(win_after=100)
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[RuntimeError("planner down")],
+        )
+        executor, planner = build(client)
+        result = run_episode(adapter, executor, "goal", max_steps=20, escalate=planner)
         self.assertFalse(result.success)
-        self.assertIn("no probability for a legal action", result.error)
+        self.assertIn("planner unavailable", result.error)
+
+    def test_forbidden_action_is_not_executed(self) -> None:
+        adapter = FakeAdapter(win_after=2)
+        client = ScriptedClient(
+            executor=[executor_reply("wait"), executor_reply("right")],
+            planner=[planner_reply(avoid=["wait"])],
+        )
+        executor, planner = build(client)
+        result = run_episode(adapter, executor, "goal", max_steps=4, escalate=planner)
+        self.assertEqual(result.decisions[0].by, "fallback")
+        self.assertEqual(result.decisions[0].action_id, "right")
+
+    def test_planner_stamps_the_executor_step_so_ages_align(self) -> None:
+        """`issued_at_step` must come from the executor's clock, not the adapter's.
+
+        `PlanDirective.age(step)` subtracts that stamp from the executor's counter,
+        so a plan stamped with a different counter would look arbitrarily old (or
+        young) for its whole life.
+        """
+        adapter = FakeAdapter(win_after=3)
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[planner_reply(stage_goal="walk")],
+        )
+        executor, planner = build(client)
+        run_episode(adapter, executor, "goal", max_steps=4, escalate=planner)
+        self.assertEqual(executor.plan.issued_at_step, 1)
+        self.assertEqual(executor.plan.age(executor.steps), executor.steps - 1)
+
+    def test_show_decision_receives_the_declared_plan(self) -> None:
+        adapter = FakeAdapter(win_after=1)
+        seen: list[dict] = []
+        adapter.show_decision = lambda decision, panel: seen.append(panel)  # type: ignore[attr-defined]
+        client = ScriptedClient(
+            executor=[executor_reply("right")],
+            planner=[planner_reply(stage_goal="exit", tactics="right")],
+        )
+        executor, planner = build(client)
+        run_episode(adapter, executor, "goal", max_steps=2, escalate=planner)
+        self.assertEqual(seen[0]["stage_goal"], "exit")
+        self.assertEqual(seen[0]["tactics"], "right")
+        self.assertEqual(seen[0]["plan_revision"], 1)
+        self.assertEqual(seen[0]["planner_model"], "fake-planner")
 
 
 if __name__ == "__main__":
