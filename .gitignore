@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Recorded episodes and SFT samples are per-run artefacts and can be large
+# (raw screen recordings reach multiple GB). They are evidence, not source.
+runs/
+
+# Never commit credentials. Both tiers read their token from the environment.
+.env
+.env.*
+
+.DS_Store
+Thumbs.db

@@ -1,0 +1,19 @@
+# Runtime dependencies of the fast/slow decision core.
+#
+# Only what the code actually imports. The adapters pull in the browser layer,
+# so playwright is needed even though the decision logic itself is pure Python;
+# tests run without a browser because they use fake adapters.
+
+# Screenshot re-encoding for the fast tier (downscales one frame to a compact
+# JPEG before it is sent, which cut upload bytes by an order of magnitude).
+Pillow>=10.0
+
+# Browser host used by the web-runtime and generic-html adapters.
+playwright>=1.40
+
+# macOS window capture backend (capture_mac.py). Not needed on Windows or Linux,
+# where capture_win.py uses only the standard library.
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+
+# Test runner.
+pytest>=7.4
