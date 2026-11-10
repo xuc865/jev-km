@@ -43,6 +43,13 @@ VERDICT_PIVOT = "pivot"
 VERDICT_FINISH = "finish"
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
 class PlannerPolicy:
     """Publishes plan revisions; exposes them as ``.plan`` for the executor.
 
@@ -62,7 +69,16 @@ class PlannerPolicy:
         self.client = client
         self.model = model or os.environ.get("JEVGAMER_PLANNER_MODEL", "deepseek-v4.1-flash")
         self.identity = identity
-        self.max_tokens = max_tokens
+        # A plan revision carries briefing (<=1200 chars) plus stage_goal, tactics
+        # and situation. 512 output tokens truncated every single review into an
+        # unterminated JSON object, which is why the planner had a 0% label rate.
+        # The ceiling is deliberately generous because the cost of a rejected
+        # review is a whole stale plan interval, not just one answer.
+        self.max_tokens = (
+            int(max_tokens)
+            if max_tokens is not None
+            else _env_int("JEVGAMER_PLANNER_MAX_TOKENS", 2048)
+        )
         self.plan = PlanDirective()
         self.locked_goal: str | None = None
         self.error = ""
@@ -113,6 +129,8 @@ class PlannerPolicy:
             model=self.model,
             system=planner_system(self.identity, goal),
             user_payload=payload,
+            image=obs.image or "",
+            max_tokens=self.max_tokens,
         )
         if call.error:
             self.error = call.error

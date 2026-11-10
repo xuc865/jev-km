@@ -88,11 +88,21 @@ class ExecutorPolicy:
         max_candidates: int = 32,
         confidence: float | None = None,
         review_every: int = 8,
+        max_tokens: int | None = None,
     ) -> None:
         self.client = client
         self.model = model or os.environ.get("JEVGAMER_EXECUTOR_MODEL", "deepseek-v4.1-flash")
         self.identity = identity
         self.max_candidates = max(2, int(max_candidates))
+        # The executor's reply is one action plus five short fields, but a verbose
+        # model will spend hundreds of tokens restating the plan before answering.
+        # A ceiling that is too tight does not shorten the answer, it cuts the JSON
+        # mid-object and turns a usable label into a rejected one.
+        self.max_tokens = (
+            int(max_tokens)
+            if max_tokens is not None
+            else _env_int("JEVGAMER_EXECUTOR_MAX_TOKENS", 1024)
+        )
         # Self-reported confidence below this escalates. Unlike the old gate this
         # is the model's own number about its own choice, not a softmax top mass,
         # so it is comparable across candidate counts.
@@ -337,6 +347,8 @@ class ExecutorPolicy:
             model=self.model,
             system=executor_system(self.identity, goal),
             user_payload=payload,
+            image=obs.image or "",
+            max_tokens=self.max_tokens,
         )
         if call.error:
             return self._fallback(obs, world, f"executor call failed: {call.error}")

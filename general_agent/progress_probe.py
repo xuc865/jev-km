@@ -20,12 +20,13 @@ reads the value back on demand. Two details matter:
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAP_ROOT = ROOT / "map"
+MAP_ROOT = Path(os.environ.get("JEVGAMER_MAP_ROOT") or (ROOT / "map")).resolve()
 
 INJECT = """
 (game) => {

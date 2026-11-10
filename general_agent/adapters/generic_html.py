@@ -34,7 +34,7 @@ from ..types import Action, Observation
 from .. import progress_probe
 
 ROOT = Path(__file__).resolve().parents[2]
-MAP_ROOT = ROOT / "map"
+MAP_ROOT = Path(os.environ.get("JEVGAMER_MAP_ROOT") or (ROOT / "map")).resolve()
 
 # Generic input the overwhelming majority of web games accept. These are
 # offered unconditionally because without a pack there is no declarative

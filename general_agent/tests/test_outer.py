@@ -157,8 +157,8 @@ class PayloadTests(unittest.TestCase):
         payload = client.payloads("planner")[0]
         self.assertEqual(
             list(payload),
-            ["world", "current_plan", "executor_report", "recent_actions",
-             "review_trigger", "output_schema"],
+            ["output_schema", "world", "current_plan", "executor_report",
+             "recent_actions", "review_trigger"],
         )
 
     def test_missing_trigger_gets_an_explicit_value(self) -> None:

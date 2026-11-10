@@ -34,12 +34,14 @@ class ScriptedClient:
         self.last_error = ""
         self.asked: list[dict] = []
 
-    def complete(self, role, model, system, user_payload, *, temperature=0.0) -> ModelCall:
+    def complete(self, role, model, system, user_payload, *, temperature=0.0, image="",
+                 max_tokens=None) -> ModelCall:
         script = self.scripts.get(role) or [""]
         index = sum(1 for call in self.calls if call.role == role)
         text = script[min(index, len(script) - 1)]
         self.asked.append(
-            {"role": role, "system": system, "payload": user_payload, "model": model}
+            {"role": role, "system": system, "payload": user_payload, "model": model,
+             "image": image, "max_tokens": max_tokens}
         )
         error = ""
         if isinstance(text, Exception):
@@ -58,6 +60,7 @@ class ScriptedClient:
             error=error,
             status=0 if not error else 500,
             schema=SCHEMA_VERSION,
+            frame_sha="f" * 16 if image else "",
         )
         self.calls.append(call)
         self._pending.append(call)

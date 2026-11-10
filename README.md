@@ -148,17 +148,34 @@ real-time control. Real-time is a separate opt-in profile.
 accepted contract object onto the call as `label`; `RoleRecorder` writes those to
 `roles.jsonl` per run.
 
-- a call with `error` is a transport failure, counted as `failed`;
-- a call that arrived but whose label failed validation is also `failed`, which is
-  what makes a prompt regression visible as a validation rate;
-- a call with a valid label whose step had no numeric progress metric is counted
-  `unproven` and not written — an unverifiable row looks like supervision without
-  being supervision.
+Every exchange is written, including the ones that cannot be used as supervision.
+A filtered dataset can be derived from a complete one, never the reverse, so the
+recorder marks rows instead of dropping them:
+
+- `error` non-empty with a transport cause: no reply arrived, counted as `failed`;
+- `error: "reasoning only"`: the reply is the model's reasoning draft, because
+  `content` came back empty. This is a budget problem, not a prompt problem;
+- `error: "label rejected"`: an answer arrived but failed contract validation;
+- `proven: false`: the step had no readable numeric metric, so the label cannot be
+  scored against game state. The row is still written.
+
+`summary.json` reports `failed`, `invalid` and a `reasons` breakdown, so a batch can
+be triaged by cause rather than by a single failure count.
 
 Each row carries `schema`, `role`, `game`, `run_id`, `goal`, `step`,
-`plan_revision`, `trigger`, `messages`, `label`, `raw_reply` and `progress`, so a
-dataset assembled across a refactor can be filtered by `schema` instead of silently
-mixing two prompt shapes.
+`plan_revision`, `trigger`, `messages`, `label`, `raw_reply`, `frame_sha`,
+`from_reasoning`, `proven` and `progress`, so a dataset assembled across a refactor
+can be filtered by `schema` instead of silently mixing two prompt shapes.
+
+Frames are stored once per content hash under `frames/`, and `trace.jsonl` refers to
+the frame by `image_sha` rather than inlining base64. Inlining cost 340 KB per step
+and made a 13-step trace 4 MB; with the reference it is 73 KB.
+
+Both roles are budgeted separately, because a plan revision is far longer than one
+action: `JEVGAMER_EXECUTOR_MAX_TOKENS` (default 1024) and
+`JEVGAMER_PLANNER_MAX_TOKENS` (default 2048). A reply that stops on the ceiling is
+retried once at double the budget, since a truncated JSON object is not a short
+answer but an unparseable one.
 
 ## Layout
 
@@ -194,10 +211,33 @@ pip install -r requirements.txt
 python -m pytest general_agent/tests -q
 ```
 
-Expected on this snapshot: `173 passed, 2 subtests passed`. The suite covers the
+Expected on this snapshot: `225 passed, 2 subtests passed`. The suite covers the
 contract (parsing, merging, lifetime rules, canonical encoding), the trigger order,
 plan adoption and rejection, the planner's refusal to name an action, keyboard
-pruning, the distillation writer, and the live panel's field names.
+pruning, output budgets and truncation recovery, the distillation writer, dataset
+assembly, game selection for a batch, and the live panel's field names.
+
+## Collecting a batch
+
+```bash
+set JEVGAMER_MAP_ROOT=D:\path\to\game\assets
+python tools\collect_sft.py --dry-run              # list games and budgets, spend nothing
+python tools\collect_sft.py --workers 3 --steps 40 # then actually run them
+python tools\build_dataset.py                      # merge into sft.jsonl + manifest.json
+```
+
+`--dry-run` prints the resolved game list, the pack root, the map root and both
+token budgets before any browser starts. That check exists because an unset map root
+previously made every game fail identically after the browser had already launched.
+
+Each game gets its own folder and its own browser, so `--workers` parallelises games
+without letting two games share DOM state. `--resume` skips games whose index row
+says they completed.
+
+`build_dataset.py` produces three files: `sft.jsonl` (every row, whole
+trajectories), `sft_clean.jsonl` (rows with a validated label; add `--proven-only`
+to also require a numeric metric) and `manifest.json` (counts by role, game, trigger
+and error reason, plus trajectory lengths).
 
 ## Configuration
 
@@ -211,6 +251,10 @@ Secrets are read from the environment, never from the tree:
 | `JEVGAMER_EXECUTOR_MODEL` | executor model, default `deepseek-v4.1-flash` |
 | `JEVGAMER_PLANNER_MODEL` | planner model, default `deepseek-v4.1-flash` |
 | `JEVGAMER_EXECUTOR_CONFIDENCE` | self-reported confidence threshold, default 0.45 |
+| `JEVGAMER_EXECUTOR_MAX_TOKENS` | executor output budget, default 1024 |
+| `JEVGAMER_PLANNER_MAX_TOKENS` | planner output budget, default 2048 |
+| `JEVGAMER_MAP_ROOT` | where game assets live, when they are outside `map/` |
+| `JEVGAMER_SEED` | deterministic input seed, default 42 |
 | `JEVGAMER_SFT_DIR` | root for `roles.jsonl` output |
 
 Thinking is off by default for both roles. Measurements showed a review spending

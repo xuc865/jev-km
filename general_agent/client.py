@@ -61,6 +61,11 @@ class ModelCall:
     contract object that was validated: the policy is the only place that knows
     whether a reply passed validation, and re-parsing it later in the writer would
     duplicate that logic and could disagree with it.
+
+    ``frame_sha`` identifies the frame that was attached to this call. The image
+    itself is stored once per unique hash in the run folder rather than inline:
+    200 PNG turns per game would dwarf every label in the dataset, and most
+    consecutive frames are identical.
     """
 
     role: str
@@ -74,6 +79,8 @@ class ModelCall:
     attempts: int = 1
     schema: str = ""
     label: dict = field(default_factory=dict)
+    frame_sha: str = ""
+    from_reasoning: bool = False
 
     def to_wire(self) -> dict:
         return {
@@ -88,6 +95,8 @@ class ModelCall:
             "status": self.status,
             "attempts": self.attempts,
             "label": self.label,
+            "frame_sha": self.frame_sha,
+            "from_reasoning": self.from_reasoning,
         }
 
 
@@ -118,14 +127,26 @@ class ModelClient:
         self._pending: list[ModelCall] = []
         self.last_error = ""
 
-    def _payload(self, model: str, messages: list[dict], temperature: float) -> dict:
+    def _payload(
+        self,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int | None = None,
+    ) -> dict:
         payload: dict[str, Any] = {
             "model": model,
             "temperature": temperature,
             "messages": messages,
         }
-        if self.max_tokens is not None:
-            payload["max_tokens"] = int(self.max_tokens)
+        # Per-call override wins over the client default. The two roles do not need
+        # the same budget: a planner reply carries a briefing plus tactics, so the
+        # ceiling that is generous for one action is truncation for one plan. A
+        # truncated reply is not a slow reply, it is an unparseable one, and 0-of-9
+        # planner labels were lost to exactly that.
+        budget = self.max_tokens if max_tokens is None else max_tokens
+        if budget is not None:
+            payload["max_tokens"] = int(budget)
         # Explicit reasoning switch: left on, the slow tier spent ~1250 completion
         # tokens and 10.6s per review on a reply that is a small JSON object, and
         # sometimes consumed the whole budget so `content` came back empty.
@@ -180,6 +201,8 @@ class ModelClient:
         user_payload: dict,
         *,
         temperature: float = 0.0,
+        image: str = "",
+        max_tokens: int | None = None,
     ) -> ModelCall:
         """One completion, recorded whether it succeeds or fails.
 
@@ -187,37 +210,97 @@ class ModelClient:
         identical situations. Recording the failure path matters: a run whose slow
         tier never answered is not training data, and the SFT writer decides that
         from ``error`` rather than from an empty ``text``.
+
+        ``image`` is a data URL. It is attached as a separate content part rather
+        than embedded in the JSON so the text half of the turn stays byte-stable:
+        a base64 blob inside the encoded payload would change every frame and make
+        the recorded prompt useless as a training example. The frame is also
+        deliberately not recorded in ``messages`` -- it is referenced by
+        ``frame_sha`` instead, since 200 steps of PNG would dwarf the labels.
+
+        ``max_tokens`` overrides the client ceiling for this call only, which is
+        how the planner gets room for a briefing while the executor stays tight.
+
+        When the reply stops on the ceiling, the call is retried once with double
+        the budget. That is the difference between a slow answer and no answer: a
+        truncated JSON object cannot be parsed, and the plan it was carrying is
+        lost for a whole review interval. Only one escalation is allowed, so a
+        model that rambles forever still terminates.
         """
         from .contract import SCHEMA_VERSION, encode
 
+        user_content: Any = encode(user_payload)
+        if image:
+            user_content = [
+                {"type": "text", "text": user_content},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": encode(user_payload)},
+            {"role": "user", "content": user_content},
         ]
+        budget = self.max_tokens if max_tokens is None else max_tokens
         started = time.monotonic()
-        raw = self._send(self._payload(model, messages, temperature))
+        raw = self._send(self._payload(model, messages, temperature, budget))
         elapsed = int((time.monotonic() - started) * 1000)
 
         error = str(raw.get("_error") or "")
         status = int(raw.get("_status") or 0)
         attempts = int(raw.get("_attempts") or 1)
+        usage = raw.get("usage") or {}
         text = ""
+        from_reasoning = False
         if not error:
-            text = _extract_text(raw)
+            text, from_reasoning = _extract_text(raw)
+            needs_room = from_reasoning or _hit_the_ceiling(usage, budget)
+            if needs_room and budget:
+                wider_budget = int(budget) * 2
+                wider = self._payload(model, messages, temperature, wider_budget)
+                started = time.monotonic()
+                retry = self._send(wider)
+                retry_usage = retry.get("usage") or {}
+                retry_text, retry_reasoning = _extract_text(retry)
+                # Accept the retry only when it produced actual content and was not
+                # itself cut off. A second draft, or a second truncation, would mean
+                # the model cannot answer in this shape at all; the first attempt is
+                # then the more honest record of that.
+                usable = (
+                    retry_text
+                    and not retry_reasoning
+                    and not retry.get("_error")
+                    and not _hit_the_ceiling(retry_usage, wider_budget)
+                )
+                if usable:
+                    attempts += int(retry.get("_attempts") or 1)
+                    usage = retry_usage
+                    text, from_reasoning = retry_text, False
+                    status = int(retry.get("_status") or 0)
+                elapsed = int((time.monotonic() - started) * 1000)
             if not text:
                 error = "model returned empty content"
         self.last_error = error
+        # The proxy echoes a generic "default" instead of the model it routed to, so
+        # the echoed value is only trusted when it actually names something. The
+        # requested name is what a dataset needs: a row whose model is "default"
+        # cannot say which teacher produced the label.
+        echoed = str(raw.get("model") or "").strip()
+        served = echoed if echoed and echoed.lower() not in {"default", "unknown"} else model
         call = ModelCall(
             role=role,
-            model=str(raw.get("model") or model),
-            messages=messages,
+            model=served,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": encode(user_payload)},
+            ],
             text=text,
             ms=elapsed,
-            usage=raw.get("usage") or {},
+            usage=usage,
             error=error,
             status=status,
             attempts=attempts,
             schema=SCHEMA_VERSION,
+            frame_sha=_sha_of(image),
+            from_reasoning=from_reasoning,
         )
         self.calls.append(call)
         self._pending.append(call)
@@ -235,26 +318,60 @@ class ModelClient:
         return pending
 
 
-def _extract_text(raw: dict) -> str:
+def _sha_of(data_url: str) -> str:
+    """Content hash of an attached frame, used to deduplicate stored images."""
+    if not data_url:
+        return ""
+    _, _, body = data_url.partition("base64,")
+    if not body:
+        return ""
+    import hashlib
+
+    return hashlib.sha1(body.encode("ascii", "ignore")).hexdigest()[:16]
+
+
+def _extract_text(raw: dict) -> tuple[str, bool]:
     """Pull the assistant text out of a completion body.
 
-    Handles three shapes that all occur here: a plain string, a content-part
-    list, and a reply whose visible text is empty because a reasoning model spent
-    the whole budget thinking. In the last case the JSON is frequently already
-    drafted inside ``reasoning_content``, so it is returned as a last resort --
-    a parsed answer beats a discarded step.
+    Returns ``(text, from_reasoning)``. The flag is not cosmetic: a reply with an
+    empty ``content`` but a populated ``reasoning_content`` means the model spent
+    its entire output budget thinking and never wrote the answer. That text is
+    still worth returning -- the JSON is often drafted inside it and a parsed
+    answer beats a discarded step -- but the caller must know it is a draft, not
+    an answer, because a draft is exactly what a token ceiling cuts in half.
     """
     try:
         message = raw["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
-        return ""
+        return "", False
     content = message.get("content")
     if isinstance(content, list):
-        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict)).strip()
+        joined = "".join(
+            str(part.get("text") or "") for part in content if isinstance(part, dict)
+        ).strip()
+        if joined:
+            return joined, False
     if isinstance(content, str) and content.strip():
-        return content.strip()
+        return content.strip(), False
     reasoning = message.get("reasoning_content")
-    return str(reasoning).strip() if isinstance(reasoning, str) else ""
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip(), True
+    return "", False
+
+
+def _hit_the_ceiling(usage: dict, budget: int | None) -> bool:
+    """Whether the reply stopped because the budget ran out.
+
+    ``finish_reason`` is authoritative when the service sends it, but it is not
+    always present, so the token count is checked as well: a completion that used
+    exactly the budget was cut, not finished.
+    """
+    if not isinstance(usage, dict) or budget is None:
+        return False
+    used = usage.get("completion_tokens")
+    if not isinstance(used, int):
+        return False
+    return used >= int(budget)
 
 
 def _default_url() -> str:

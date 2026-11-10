@@ -184,8 +184,10 @@ class RenderingTests(unittest.TestCase):
 
     def test_executor_payload_declares_exactly_four_sections(self) -> None:
         payload = render_executor_payload(self.world(), PlanDirective(), ["right"], 2)
+        # The schema leads so the model reads the answer shape before the world
+        # block; verbose "prose then JSON" replies came from it being last.
         self.assertEqual(
-            list(payload), ["world", "plan", "recent_actions", "repeat_run", "output_schema"]
+            list(payload), ["output_schema", "world", "plan", "recent_actions", "repeat_run"]
         )
         self.assertEqual(payload["repeat_run"], 2)
         self.assertEqual(payload["world"]["step"], 11)
@@ -194,8 +196,8 @@ class RenderingTests(unittest.TestCase):
         payload = render_planner_payload(self.world(), PlanDirective(), None, [], "first_step")
         self.assertEqual(
             list(payload),
-            ["world", "current_plan", "executor_report", "recent_actions",
-             "review_trigger", "output_schema"],
+            ["output_schema", "world", "current_plan", "executor_report",
+             "recent_actions", "review_trigger"],
         )
         self.assertEqual(payload["review_trigger"], "first_step")
         self.assertIsNone(payload["executor_report"])

@@ -16,7 +16,7 @@ from urllib.parse import quote, unquote, urlsplit
 from .timing import timing_contract
 
 ROOT = Path(__file__).resolve().parents[1]
-MAP_ROOT = ROOT / "map"
+MAP_ROOT = Path(os.environ.get("JEVGAMER_MAP_ROOT") or (ROOT / "map")).resolve()
 CLOCK = Path(__file__).with_name("clock.js")
 
 # Explicit map: Windows reads MIME types from the registry, so .js can come back

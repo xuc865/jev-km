@@ -435,8 +435,9 @@ EXECUTOR_SCHEMA_HINT = (
 )
 
 PLANNER_SCHEMA_HINT = (
-    '{"briefing":"<=1200 chars, keep unless wrong","stage_goal":"<=400 chars",'
-    '"tactics":"<=800 chars","situation":"<=300 chars","avoid":["action ids"],'
+    '{"briefing":"omit after the first review unless factually wrong","'
+    'stage_goal":"<=400 chars, only when it changes","tactics":"<=800 chars",'
+    '"situation":"<=300 chars","avoid":["action ids"],'
     '"exclude":["input ids to stop offering"],'
     '"review_in":8,"verdict":"continue|pivot|finish","note":"<=200 chars"}'
 )
@@ -448,13 +449,20 @@ def render_executor_payload(
     recent: list[str],
     repeat_run: int,
 ) -> dict:
-    """The executor's user turn: environment, plan, history, nothing else."""
+    """The executor's user turn: answer shape first, then environment and plan.
+
+    ``output_schema`` leads deliberately. The previous order put it last, after a
+    world block containing state and dozens of legal actions, and verbose replies
+    were the result: the model had already started composing prose before it read
+    the required shape. Leading with the schema makes the first token it emits
+    the opening brace.
+    """
     return {
+        "output_schema": EXECUTOR_SCHEMA_HINT,
         "world": world.to_wire(),
         "plan": plan.to_wire(),
         "recent_actions": list(recent[-12:]),
         "repeat_run": repeat_run,
-        "output_schema": EXECUTOR_SCHEMA_HINT,
     }
 
 
@@ -465,14 +473,18 @@ def render_planner_payload(
     recent: list[str],
     trigger: str,
 ) -> dict:
-    """The planner's user turn: the same world plus the executor's report."""
+    """The planner's user turn: answer shape first, then the same world.
+
+    Same reasoning as the executor payload: a plan revision is the longest reply
+    in the system, so the schema goes where it cannot be missed.
+    """
     return {
+        "output_schema": PLANNER_SCHEMA_HINT,
         "world": world.to_wire(),
         "current_plan": plan.to_wire(),
         "executor_report": report.to_wire() if report else None,
         "recent_actions": list(recent[-12:]),
         "review_trigger": trigger,
-        "output_schema": PLANNER_SCHEMA_HINT,
     }
 
 
